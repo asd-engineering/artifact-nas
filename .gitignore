@@ -1,0 +1,10 @@
+# Secrets — NEVER commit. These are the SOURCE for the GitHub secrets,
+# kept local only. The obscured SFTP password lives in rclone.conf.
+.rclone/
+.env
+
+# Noise
+*.log
+node_modules/
+.DS_Store
+tmp/

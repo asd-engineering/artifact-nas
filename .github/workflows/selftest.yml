@@ -1,0 +1,46 @@
+name: Self-test
+
+# Validates the composite action end-to-end on a real self-hosted runner:
+# decode RCLONE_CONF_B64 -> rclone SFTP -> copy a probe artifact to the NAS.
+# Uses `uses: ./` so it tests THIS branch's action.yml verbatim.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: selftest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nas-conf:
+    name: NAS upload (env-fallback, nas-only)
+    runs-on: [self-hosted, Linux]
+    # Config set once at job level — the action reads it via env fallback,
+    # so the upload step needs no nas-* inputs (this is how release.yml calls it).
+    env:
+      RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
+      NAS_DEST: ${{ secrets.NAS_DEST }}
+    steps:
+      - name: Wipe workspace (self-hosted runner safety)
+        run: rm -rf "$GITHUB_WORKSPACE"/* "$GITHUB_WORKSPACE"/.[!.]* 2>/dev/null || true
+
+      - uses: actions/checkout@v4
+
+      - name: Build probe artifact
+        run: |
+          mkdir -p tmp/probe
+          {
+            echo "run_id=${{ github.run_id }}"
+            echo "repo=${{ github.repository }}"
+            date -u +%FT%TZ
+          } > tmp/probe/probe.txt
+
+      - name: Upload via action (env-fallback, nas-only)
+        uses: ./
+        with:
+          name: selftest-conf
+          path: tmp/probe/
+          mode: nas-only
+          # No nas-* inputs: conf-b64 + dest come from job env; remote is
+          # auto-detected from the conf.
