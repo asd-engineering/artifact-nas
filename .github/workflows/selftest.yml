@@ -1,8 +1,8 @@
 name: Self-test
 
-# Validates the composite action end-to-end on a real self-hosted runner:
-# decode RCLONE_CONF_B64 -> rclone SFTP -> copy a probe artifact to the NAS.
-# Uses `uses: ./` so it tests THIS branch's action.yml verbatim.
+# Validates BOTH flavours end-to-end on a real self-hosted runner: upload a
+# probe to the NAS, then download it back and diff. Uses `./upload` and
+# `./download` so it tests THIS branch's actions verbatim.
 on:
   push:
     branches: [main]
@@ -13,11 +13,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  nas-conf:
-    name: NAS upload (env-fallback, nas-only)
+  roundtrip:
+    name: NAS upload + download round-trip (nas-only)
     runs-on: [self-hosted, Linux]
-    # Config set once at job level — the action reads it via env fallback,
-    # so the upload step needs no nas-* inputs (this is how release.yml calls it).
+    # Config set once at job level — both actions read it via env fallback,
+    # so the steps need no nas-* inputs.
     env:
       RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
       NAS_DEST: ${{ secrets.NAS_DEST }}
@@ -29,18 +29,36 @@ jobs:
 
       - name: Build probe artifact
         run: |
-          mkdir -p tmp/probe
+          mkdir -p tmp
           {
             echo "run_id=${{ github.run_id }}"
             echo "repo=${{ github.repository }}"
             date -u +%FT%TZ
-          } > tmp/probe/probe.txt
+          } > tmp/probe.txt
+          sha256sum tmp/probe.txt | awk '{print $1}' > tmp/probe.sha256
 
-      - name: Upload via action (env-fallback, nas-only)
-        uses: ./
+      - name: Upload to NAS (./upload, nas-only)
+        uses: ./upload
         with:
-          name: selftest-conf
-          path: tmp/probe/
+          name: selftest-roundtrip
+          path: tmp/probe.txt
           mode: nas-only
-          # No nas-* inputs: conf-b64 + dest come from job env; remote is
-          # auto-detected from the conf.
+
+      - name: Clear local copy
+        run: rm -rf tmp/probe.txt restored
+
+      - name: Download from NAS (./download, nas-only)
+        uses: ./download
+        with:
+          name: selftest-roundtrip
+          path: restored
+          mode: nas-only
+
+      - name: Verify round-trip
+        run: |
+          test -f restored/probe.txt || { echo "::error::restored/probe.txt missing"; exit 1; }
+          got="$(sha256sum restored/probe.txt | awk '{print $1}')"
+          want="$(cat tmp/probe.sha256)"
+          echo "want=$want got=$got"
+          [ "$got" = "$want" ] || { echo "::error::checksum mismatch after round-trip"; exit 1; }
+          echo "✅ round-trip OK"

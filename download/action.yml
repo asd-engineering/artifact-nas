@@ -1,0 +1,182 @@
+name: "Download Artifact (NAS fallback)"
+description: >-
+  Download a CI artifact from GitHub Actions; if it isn't there (e.g. it was
+  stored on the NAS because the storage quota was hit at upload time) fall back
+  to fetching it from a NAS over rclone SFTP. Pairs with the upload flavour.
+  Credentials come from GitHub secrets — no rclone.conf checked in.
+author: "asd-engineering"
+
+branding:
+  icon: "download-cloud"
+  color: "blue"
+
+inputs:
+  # --- artifact (mirrors actions/download-artifact) ---
+  name:
+    description: "Artifact name."
+    required: true
+  path:
+    description: "Destination directory for the downloaded files."
+    required: false
+    default: "."
+
+  # --- behaviour ---
+  mode:
+    description: >-
+      fallback = GitHub first, NAS only if the GitHub artifact is missing (default).
+      nas-only = skip GitHub, fetch from NAS only.
+    required: false
+    default: "fallback"
+
+  # --- NAS creds (each input also reads its ambient $NAS_*/$RCLONE_CONF_B64) ---
+  nas-host:
+    description: "NAS SFTP host/IP. Falls back to $NAS_HOST."
+    required: false
+    default: ""
+  nas-user:
+    description: "NAS SFTP user. Falls back to $NAS_USER."
+    required: false
+    default: ""
+  nas-pass:
+    description: "NAS SFTP password (plaintext; obscured at runtime). Falls back to $NAS_PASS."
+    required: false
+    default: ""
+  nas-port:
+    description: "NAS SFTP port. Falls back to $NAS_PORT, then 22."
+    required: false
+    default: ""
+  nas-dest:
+    description: "Base path on the NAS to read from. Falls back to $NAS_DEST, then /artifacts."
+    required: false
+    default: ""
+
+  # --- alternative: bring your own rclone.conf (base64) ---
+  nas-conf-b64:
+    description: >-
+      base64 of a full rclone.conf. If set, takes precedence over the
+      nas-host/user/pass inputs. Falls back to $RCLONE_CONF_B64.
+    required: false
+    default: ""
+  nas-remote:
+    description: >-
+      rclone remote name inside nas-conf-b64. If empty, the first remote in the
+      decoded conf is auto-detected.
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Download from GitHub Actions artifacts
+      id: gh
+      if: ${{ inputs.mode != 'nas-only' }}
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+
+    - name: Download from NAS (rclone SFTP fallback)
+      if: >-
+        ${{ inputs.mode == 'nas-only' ||
+            (inputs.mode == 'fallback' && steps.gh.outcome == 'failure') }}
+      shell: bash
+      # Inputs come in as IN_* so they don't clobber the ambient NAS_*/
+      # RCLONE_CONF_B64 a caller may set once at job level. Each value resolves
+      # input-first, then ambient env, then a default.
+      env:
+        MODE: ${{ inputs.mode }}
+        ART_NAME: ${{ inputs.name }}
+        DEST_PATH: ${{ inputs.path }}
+        IN_HOST: ${{ inputs.nas-host }}
+        IN_USER: ${{ inputs.nas-user }}
+        IN_PASS: ${{ inputs.nas-pass }}
+        IN_PORT: ${{ inputs.nas-port }}
+        IN_DEST: ${{ inputs.nas-dest }}
+        IN_CONF_B64: ${{ inputs.nas-conf-b64 }}
+        IN_REMOTE: ${{ inputs.nas-remote }}
+      run: |
+        set -euo pipefail
+
+        # --- resolve config: input > ambient env > default ---
+        NAS_CONF_B64="${IN_CONF_B64:-${RCLONE_CONF_B64:-}}"
+        NAS_REMOTE="${IN_REMOTE:-${NAS_REMOTE:-}}"
+        NAS_HOST="${IN_HOST:-${NAS_HOST:-}}"
+        NAS_USER="${IN_USER:-${NAS_USER:-}}"
+        NAS_PASS="${IN_PASS:-${NAS_PASS:-}}"
+        NAS_PORT="${IN_PORT:-${NAS_PORT:-22}}"
+        NAS_DEST="${IN_DEST:-${NAS_DEST:-/artifacts}}"
+        DEST_PATH="${DEST_PATH:-.}"
+
+        if [ "${MODE}" = "fallback" ]; then
+          echo "::warning::GitHub artifact '${ART_NAME}' not found — falling back to NAS."
+        fi
+
+        # --- ensure rclone (no sudo: fetch the static binary into a temp dir) ---
+        if ! command -v rclone >/dev/null 2>&1; then
+          echo "rclone not found — downloading static binary…"
+          case "$(uname -m)" in
+            x86_64) RC_ARCH=amd64 ;;
+            aarch64|arm64) RC_ARCH=arm64 ;;
+            *) RC_ARCH=amd64 ;;
+          esac
+          RC_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"   # linux | darwin
+          RC_TMP="$(mktemp -d)"
+          curl -fsSL "https://downloads.rclone.org/rclone-current-${RC_OS}-${RC_ARCH}.zip" -o "${RC_TMP}/rclone.zip"
+          unzip -q "${RC_TMP}/rclone.zip" -d "${RC_TMP}"
+          RC_BIN="$(find "${RC_TMP}" -type f -name rclone | head -n1)"
+          chmod +x "${RC_BIN}"
+          export PATH="$(dirname "${RC_BIN}"):${PATH}"
+        fi
+        echo "Using $(rclone version | head -n1)"
+
+        # --- resolve remote: conf-b64 (file) takes precedence over user/pass ---
+        REMOTE=""
+        CLEANUP_CONF=""
+        if [ -n "${NAS_CONF_B64}" ]; then
+          CONF_FILE="$(mktemp)"
+          CLEANUP_CONF="${CONF_FILE}"
+          printf '%s' "${NAS_CONF_B64}" | base64 -d > "${CONF_FILE}"
+          chmod 600 "${CONF_FILE}"
+          export RCLONE_CONFIG="${CONF_FILE}"
+          if [ -n "${NAS_REMOTE}" ]; then
+            REMOTE="${NAS_REMOTE}"
+          else
+            REMOTE="$(sed -n 's/^\[\(.*\)\]$/\1/p' "${CONF_FILE}" | head -n1)"
+            if [ -z "${REMOTE}" ]; then
+              echo "::error::Could not auto-detect a remote from rclone.conf (no [section] found)." >&2
+              exit 1
+            fi
+            echo "Auto-detected rclone remote: ${REMOTE}"
+          fi
+        elif [ -n "${NAS_HOST}" ] && [ -n "${NAS_USER}" ] && [ -n "${NAS_PASS}" ]; then
+          OBSCURED="$(rclone obscure "${NAS_PASS}")"
+          echo "::add-mask::${OBSCURED}"
+          export RCLONE_CONFIG_NASFALLBACK_TYPE=sftp
+          export RCLONE_CONFIG_NASFALLBACK_HOST="${NAS_HOST}"
+          export RCLONE_CONFIG_NASFALLBACK_USER="${NAS_USER}"
+          export RCLONE_CONFIG_NASFALLBACK_PORT="${NAS_PORT}"
+          export RCLONE_CONFIG_NASFALLBACK_PASS="${OBSCURED}"
+          export RCLONE_CONFIG_NASFALLBACK_SHELL_TYPE=unix
+          export RCLONE_CONFIG_NASFALLBACK_MD5SUM_COMMAND=none
+          export RCLONE_CONFIG_NASFALLBACK_SHA1SUM_COMMAND=none
+          REMOTE="nasfallback"
+        else
+          echo "::error::No NAS credentials. Provide nas-host/nas-user/nas-pass OR nas-conf-b64." >&2
+          exit 1
+        fi
+
+        cleanup() { [ -n "${CLEANUP_CONF}" ] && rm -f "${CLEANUP_CONF}" || true; }
+        trap cleanup EXIT
+
+        # --- source mirrors the upload layout: <dest>/<owner/repo>/<run>-<attempt>/<name> ---
+        SRC_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
+        echo "NAS source: ${REMOTE}:${SRC_DIR} -> ${DEST_PATH}"
+        mkdir -p "${DEST_PATH}"
+        rclone copy "${REMOTE}:${SRC_DIR}" "${DEST_PATH}" --transfers 4 --retries 3 --low-level-retries 3 --stats-one-line
+
+        if [ -z "$(ls -A "${DEST_PATH}" 2>/dev/null)" ]; then
+          echo "::error::NAS download produced no files from ${REMOTE}:${SRC_DIR}" >&2
+          exit 1
+        fi
+        echo "✅ Artifact '${ART_NAME}' downloaded from NAS -> ${DEST_PATH}"

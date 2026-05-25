@@ -1,43 +1,64 @@
-# upload-artifact-nas
+# artifact-nas
 
 **Version:** 1.0.0
 **Last Updated:** 2026-05-25
 **Status:** ACTIVE
 
-A reusable **GitHub composite action** that uploads a CI artifact to GitHub
-Actions and, **if that fails** (e.g. the org artifact-storage quota is hit),
-falls back to copying the artifact to a NAS over **rclone SFTP**.
+Two reusable **GitHub composite actions** — `upload` and `download` — that move
+CI artifacts through GitHub Actions and, **if GitHub can't (e.g. the artifact-
+storage quota is hit), fall back to a NAS over rclone SFTP**. Use them as a
+matched pair so an artifact stored on the NAS at upload time is still found at
+download time.
 
-Credentials are supplied as **GitHub secrets (username/password)** — there is
-**no `rclone.conf` checked into this repo**. The local `.rclone/rclone.conf`
-and `.env` are the source you generate the secrets *from*; both are
-`.gitignore`d.
+| Flavour | `uses:` | Mirrors |
+|---------|---------|---------|
+| upload   | `asd-engineering/artifact-nas/upload@v1`   | `actions/upload-artifact` |
+| download | `asd-engineering/artifact-nas/download@v1` | `actions/download-artifact` |
+
+> **Repo rename:** if this repo is renamed from `upload-artifact-nas` to
+> `artifact-nas`, GitHub redirects the old path, so existing
+> `upload-artifact-nas/upload@v1` references keep resolving.
+
+Credentials are supplied as **GitHub secrets** (username/password *or* a base64
+`rclone.conf`) — there is **no `rclone.conf` checked into this repo**. The local
+`.rclone/rclone.conf` and `.env` are the source you generate the secrets *from*;
+both are `.gitignore`d.
 
 ---
 
 ## How another repo uses it
 
 ```yaml
-# .github/workflows/test.yml (any repo in the org)
-- uses: asd-engineering/upload-artifact-nas@v1
+# upload (job that produces the artifact)
+- uses: asd-engineering/artifact-nas/upload@v1
   with:
-    name: test-report
-    path: |
-      coverage/
-      tmp/test-report/
+    name: release-asd-linux-x64
+    path: dist/asd-linux-x64.tar.gz
     mode: fallback                 # GitHub first, NAS only on failure
-    nas-host: ${{ secrets.NAS_HOST }}
-    nas-user: ${{ secrets.NAS_USER }}
-    nas-pass: ${{ secrets.NAS_PASS }}
-    nas-port: ${{ secrets.NAS_PORT }}
+    nas-conf-b64: ${{ secrets.RCLONE_CONF_B64 }}
+    nas-dest: ${{ secrets.NAS_DEST }}
+
+# download (a later job in the SAME run that consumes it)
+- uses: asd-engineering/artifact-nas/download@v1
+  with:
+    name: release-asd-linux-x64
+    path: dist/
+    mode: fallback                 # GitHub first, NAS only if missing
+    nas-conf-b64: ${{ secrets.RCLONE_CONF_B64 }}
     nas-dest: ${{ secrets.NAS_DEST }}
 ```
 
-The artifact lands on the NAS under:
+Set the creds once at job/workflow `env:` level (`RCLONE_CONF_B64` + `NAS_DEST`)
+and you can drop the `nas-*` inputs entirely — both actions read them via env
+fallback. The artifact lands on / is read from the NAS under:
 
 ```
 <nas-dest>/<owner/repo>/<run_id>-<attempt>/<artifact-name>/
 ```
+
+Because the path keys on `run_id`-`run_attempt`, download resolves the same
+location upload wrote **within the same workflow run** (the intra-run handoff
+that `actions/download-artifact` does via GitHub storage).
 
 ### Inputs
 
