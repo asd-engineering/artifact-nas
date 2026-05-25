@@ -120,7 +120,11 @@ runs:
             aarch64|arm64) RC_ARCH=arm64 ;;
             *) RC_ARCH=amd64 ;;
           esac
-          RC_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"   # linux | darwin
+          case "$(uname -s)" in
+            Linux)  RC_OS=linux ;;
+            Darwin) RC_OS=osx ;;   # rclone names macOS builds "osx", not "darwin"
+            *)      RC_OS=linux ;;
+          esac
           RC_TMP="$(mktemp -d)"
           curl -fsSL "https://downloads.rclone.org/rclone-current-${RC_OS}-${RC_ARCH}.zip" -o "${RC_TMP}/rclone.zip"
           unzip -q "${RC_TMP}/rclone.zip" -d "${RC_TMP}"
