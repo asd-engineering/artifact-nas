@@ -85,6 +85,30 @@ the runner.
 | `always` | GitHub AND NAS, both every time. | Mirror critical artifacts to a self-hosted copy. |
 | `nas-only` | Skip GitHub entirely. | NAS is the canonical store, GitHub quota is precious. |
 | `nas-first` (v1.2.0) | NAS first; if NAS fails, fall back to GitHub. | NAS is preferred (faster on self-hosted runners, doesn't burn quota) but GitHub is the safety net when the NAS is having an off-day. |
+| `cache` (v1.3.0) | NAS-only at a stable cross-run path (`<nas-dest>/cache/<name>/` — no `<owner/repo>/<run>/<attempt>` scoping). Download tolerates cache miss (exits 0). | Cross-run cache of helper binaries / build outputs / anything else you'd give to `actions/cache` but want on a self-hosted NAS instead. Pair with the same `mode: cache` on both upload + download. Encode any "what version" key into the artifact name (e.g. `helpers-linux-<hashFiles>`). |
+
+### Cache mode (v1.3.0)
+
+```yaml
+# Restore (cache miss exits 0)
+- uses: asd-engineering/artifact-nas/download@v1.3.0
+  with:
+    mode: cache
+    name: helpers-linux-${{ hashFiles('modules/caddy/tpl.env', 'modules/ttyd/tpl.env') }}
+    path: ~/.cache/asd-helpers
+
+- name: Warm helpers if cache missed
+  run: ./scripts/warm-helpers.sh  # idempotent — re-runs the build only if cache was empty
+
+# Save (always overwrites the keyed path)
+- uses: asd-engineering/artifact-nas/upload@v1.3.0
+  with:
+    mode: cache
+    name: helpers-linux-${{ hashFiles('modules/caddy/tpl.env', 'modules/ttyd/tpl.env') }}
+    path: ~/.cache/asd-helpers
+```
+
+Use cache mode instead of writing a custom rclone wrapper script (e.g. the previously-needed `scripts/ci/nas-cache.sh` pattern). The action's `rclone_retry` from v1.2.0 covers SFTP-init flakes on cache mode too.
 
 ### SFTP hardening (v1.2.0+)
 
