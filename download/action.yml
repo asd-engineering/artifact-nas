@@ -196,11 +196,17 @@ runs:
           local max_attempts=5 attempt=1 backoff=1 errlog exit_code
           errlog="$(mktemp)"
           while [ "$attempt" -le "$max_attempts" ]; do
+            # Capture rclone's exit explicitly in the else-branch. Per
+            # POSIX, `$?` AFTER `if cmd; then …; fi` (no else) is 0 when
+            # the condition was false ("zero, if no condition tested
+            # true"). Without the else, `exit_code=$?` always captured 0,
+            # so rclone_retry returned success on every failure path.
             if rclone "$@" 2> >(tee "$errlog" >&2); then
               rm -f "$errlog"
               return 0
+            else
+              exit_code=$?
             fi
-            exit_code=$?
             if grep -qE "NewFs:|couldn't initialise SFTP|unexpected EOF|connection reset|version packet from server" "$errlog"; then
               if [ "$attempt" -lt "$max_attempts" ]; then
                 echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
