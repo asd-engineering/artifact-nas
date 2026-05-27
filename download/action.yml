@@ -25,6 +25,11 @@ inputs:
     description: >-
       fallback = GitHub first, NAS only if the GitHub artifact is missing (default).
       nas-only = skip GitHub, fetch from NAS only.
+      cache    = NAS-only at a stable cross-run path
+                 (<nas-dest>/cache/<name>/, no owner/repo/run/attempt
+                 scoping). Cache miss (no files at that path) exits 0
+                 with a "cache miss" note — NOT an error. Pair with
+                 `mode: cache` on the upload action.
     required: false
     default: "fallback"
 
@@ -69,7 +74,9 @@ runs:
   steps:
     - name: Download from GitHub Actions artifacts
       id: gh
-      if: ${{ inputs.mode != 'nas-only' }}
+      # `cache` mode skips GitHub entirely (per-run GH artifacts don't fit
+      # a cache contract — see upload action's mode docs).
+      if: ${{ inputs.mode != 'nas-only' && inputs.mode != 'cache' }}
       continue-on-error: true
       uses: actions/download-artifact@v4
       with:
@@ -78,7 +85,7 @@ runs:
 
     - name: Download from NAS (rclone SFTP fallback)
       if: >-
-        ${{ inputs.mode == 'nas-only' ||
+        ${{ inputs.mode == 'nas-only' || inputs.mode == 'cache' ||
             (inputs.mode == 'fallback' && steps.gh.outcome == 'failure') }}
       shell: bash
       # Inputs come in as IN_* so they don't clobber the ambient NAS_*/
@@ -173,8 +180,17 @@ runs:
         cleanup() { [ -n "${CLEANUP_CONF}" ] && rm -f "${CLEANUP_CONF}" || true; }
         trap cleanup EXIT
 
-        # --- source mirrors the upload layout: <dest>/<owner/repo>/<run>-<attempt>/<name> ---
-        SRC_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
+        # --- source ---
+        # Standard (fallback/nas-only): mirror upload's per-run layout
+        #   <dest>/<owner/repo>/<run_id>-<attempt>/<name>/
+        # Cache mode: stable cross-run path the upload-side cache mode
+        # wrote to:
+        #   <dest>/cache/<name>/
+        if [ "${MODE}" = "cache" ]; then
+          SRC_DIR="${NAS_DEST%/}/cache/${ART_NAME}"
+        else
+          SRC_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
+        fi
         echo "NAS source: ${REMOTE}:${SRC_DIR} -> ${DEST_PATH}"
         mkdir -p "${DEST_PATH}"
 
@@ -223,6 +239,24 @@ runs:
           rm -f "$errlog"
           return 1
         }
+        # `cache` mode tolerates the source not existing — cache miss is
+        # not an error, just means a prior run hasn't populated this key
+        # yet (or the key changed because inputs changed). For non-cache
+        # modes, missing source IS an error (the upload should have run
+        # before us in the same workflow).
+        if [ "${MODE}" = "cache" ]; then
+          rclone_retry copy "${REMOTE}:${SRC_DIR}" "${DEST_PATH}" "${RC_FLAGS[@]}" || {
+            echo "NAS cache miss: ${ART_NAME} (no files at ${SRC_DIR})"
+            exit 0
+          }
+          if [ -z "$(ls -A "${DEST_PATH}" 2>/dev/null)" ]; then
+            echo "NAS cache miss: ${ART_NAME} (empty at ${SRC_DIR})"
+            exit 0
+          fi
+          echo "✅ NAS cache HIT: ${ART_NAME} -> ${DEST_PATH}"
+          exit 0
+        fi
+
         rclone_retry copy "${REMOTE}:${SRC_DIR}" "${DEST_PATH}" "${RC_FLAGS[@]}"
 
         if [ -z "$(ls -A "${DEST_PATH}" 2>/dev/null)" ]; then
