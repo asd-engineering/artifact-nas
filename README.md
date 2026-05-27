@@ -66,7 +66,7 @@ that `actions/download-artifact` does via GitHub storage).
 |-------|---------|-------|
 | `name` | — (required) | Artifact name. |
 | `path` | — (required) | One path per line; globs expanded. No spaces in NAS mode (v1). |
-| `mode` | `fallback` | `fallback` \| `always` \| `nas-only`. |
+| `mode` | `fallback` | `fallback` \| `always` \| `nas-only` \| `nas-first` (v1.2.0+). |
 | `retention-days` | `7` | GitHub artifact retention. |
 | `if-no-files-found` | `warn` | `warn` \| `error` \| `ignore`. |
 | `nas-host` / `nas-user` / `nas-pass` / `nas-port` | — / — / — / `22` | SFTP creds (from secrets). |
@@ -76,6 +76,19 @@ that `actions/download-artifact` does via GitHub storage).
 
 `rclone` is auto-downloaded (static binary, no sudo) if it isn't already on
 the runner.
+
+### Modes
+
+| Mode | Behaviour | When to use |
+|------|-----------|-------------|
+| `fallback` (default) | GitHub first, NAS only if GitHub upload fails. | Most cases — let GitHub do the work, use NAS as a safety net when quota hits. |
+| `always` | GitHub AND NAS, both every time. | Mirror critical artifacts to a self-hosted copy. |
+| `nas-only` | Skip GitHub entirely. | NAS is the canonical store, GitHub quota is precious. |
+| `nas-first` (v1.2.0) | NAS first; if NAS fails, fall back to GitHub. | NAS is preferred (faster on self-hosted runners, doesn't burn quota) but GitHub is the safety net when the NAS is having an off-day. |
+
+### SFTP hardening (v1.2.0+)
+
+Default `rclone` flags include `--sftp-concurrency 1`, `--sftp-disable-concurrent-reads`, `--timeout 30s`, `--contimeout 10s`. Combined with the new `rclone_retry()` wrapper, the action survives transient `NewFs: ... unexpected EOF` failures from appliance NAS units (Asustor / Synology / QNAP) whose `sshd` has a low `MaxStartups` cap. Retry uses exponential backoff (1s, 3s, 7s, 15s, 31s; ~57 s budget across 5 attempts) and only triggers on init-layer error signatures — real errors (auth failure, permission denied) fail immediately.
 
 **Env fallback (DRY):** every `nas-*` input also reads from an ambient env var
 when the input is omitted — `nas-conf-b64`←`RCLONE_CONF_B64`,

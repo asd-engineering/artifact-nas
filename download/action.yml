@@ -177,7 +177,47 @@ runs:
         SRC_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
         echo "NAS source: ${REMOTE}:${SRC_DIR} -> ${DEST_PATH}"
         mkdir -p "${DEST_PATH}"
-        rclone copy "${REMOTE}:${SRC_DIR}" "${DEST_PATH}" --transfers 4 --retries 3 --low-level-retries 3 --stats-one-line
+
+        # Hardened flags (v1.2.0):
+        #   --sftp-concurrency 1                  one SSH channel at a time —
+        #                                         avoids hammering sshd
+        #                                         MaxStartups on appliances.
+        #   --sftp-disable-concurrent-reads       same on the read side.
+        #   --timeout 30s --contimeout 10s        bound NewFs + transfer hangs.
+        # rclone_retry() handles the init-layer EOF that --retries does NOT
+        # cover (see upload/action.yml for the full reasoning).
+        RC_FLAGS=(
+          --transfers 4 --retries 3 --low-level-retries 3
+          --sftp-concurrency 1 --sftp-disable-concurrent-reads
+          --timeout 30s --contimeout 10s
+          --stats-one-line
+        )
+        rclone_retry() {
+          local max_attempts=5 attempt=1 backoff=1 errlog exit_code
+          errlog="$(mktemp)"
+          while [ "$attempt" -le "$max_attempts" ]; do
+            if rclone "$@" 2> >(tee "$errlog" >&2); then
+              rm -f "$errlog"
+              return 0
+            fi
+            exit_code=$?
+            if grep -qE "NewFs:|couldn't initialise SFTP|unexpected EOF|connection reset|version packet from server" "$errlog"; then
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
+                sleep "$backoff"
+                backoff=$((backoff * 2 + 1))
+                attempt=$((attempt + 1))
+                continue
+              fi
+              echo "::error::NAS SFTP init kept failing after ${max_attempts} attempts. Likely sshd MaxStartups exhausted, fail2ban ban, or appliance concurrency cap."
+            fi
+            rm -f "$errlog"
+            return "$exit_code"
+          done
+          rm -f "$errlog"
+          return 1
+        }
+        rclone_retry copy "${REMOTE}:${SRC_DIR}" "${DEST_PATH}" "${RC_FLAGS[@]}"
 
         if [ -z "$(ls -A "${DEST_PATH}" 2>/dev/null)" ]; then
           echo "::error::NAS download produced no files from ${REMOTE}:${SRC_DIR}" >&2
