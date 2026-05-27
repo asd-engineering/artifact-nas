@@ -37,6 +37,14 @@ inputs:
       nas-first = NAS first; if NAS fails, fall back to GitHub. Use when the
                   NAS is the preferred sink (faster / off-quota) and GitHub
                   is the safety net.
+      cache     = NAS-only at a stable cross-run path. GitHub is skipped
+                  (per-run + retention-day artifacts don't fit a cache
+                  contract). Destination path is
+                  <nas-dest>/cache/<name>/ — NO owner/repo/run/attempt
+                  scoping. Use for save/restore of helper binaries, build
+                  caches, etc. Pair with the same `mode: cache` on the
+                  download action (which exits 0 on missing artifact —
+                  cache miss is not an error).
     required: false
     default: "fallback"
 
@@ -93,6 +101,8 @@ runs:
 
     - name: Upload to GitHub Actions artifacts
       id: gh
+      # `cache` mode skips GitHub entirely — GH artifacts are per-run +
+      # retention-bound, structurally not a cache.
       if: ${{ inputs.mode == 'fallback' || inputs.mode == 'always' }}
       continue-on-error: true
       uses: actions/upload-artifact@v4
@@ -111,7 +121,7 @@ runs:
       # nas-first mode separately with continue-on-error, and in every
       # other mode normally. Two-block split keeps the contract clean.
       if: >-
-        ${{ inputs.mode == 'nas-only' || inputs.mode == 'always' ||
+        ${{ inputs.mode == 'nas-only' || inputs.mode == 'always' || inputs.mode == 'cache' ||
             (inputs.mode == 'fallback' && steps.gh.outcome == 'failure') }}
       shell: bash
       # Inputs come in as IN_* so they don't clobber the ambient NAS_*/
@@ -209,8 +219,21 @@ runs:
         cleanup() { [ -n "${CLEANUP_CONF}" ] && rm -f "${CLEANUP_CONF}" || true; }
         trap cleanup EXIT
 
-        # --- destination: <dest>/<owner/repo>/<run_id>-<attempt>/<artifact> ---
-        DEST_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
+        # --- destination ---
+        # Standard (fallback/always/nas-only/nas-first): per-run path so
+        # different CI runs don't clobber each other —
+        #   <dest>/<owner/repo>/<run_id>-<attempt>/<artifact>/
+        # Cache mode: cross-run stable path so a later run's restore can
+        # find what an earlier run wrote —
+        #   <dest>/cache/<name>/
+        # Cache mode is keyed only by <name>; the caller is responsible for
+        # encoding any "what version of inputs" hash into the name (e.g.
+        # `helpers-linux-<hashFiles>`).
+        if [ "${MODE}" = "cache" ]; then
+          DEST_DIR="${NAS_DEST%/}/cache/${ART_NAME}"
+        else
+          DEST_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
+        fi
         echo "NAS destination: ${REMOTE}:${DEST_DIR}"
 
         # --- collect sources (glob-expanded, existing only) ---
