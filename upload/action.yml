@@ -31,9 +31,12 @@ inputs:
   # --- behaviour ---
   mode:
     description: >-
-      fallback = GitHub first, NAS only if GitHub upload fails (default).
-      always   = GitHub upload AND NAS copy.
-      nas-only = skip GitHub, NAS copy only.
+      fallback  = GitHub first, NAS only if GitHub upload fails (default).
+      always    = GitHub upload AND NAS copy.
+      nas-only  = skip GitHub, NAS copy only.
+      nas-first = NAS first; if NAS fails, fall back to GitHub. Use when the
+                  NAS is the preferred sink (faster / off-quota) and GitHub
+                  is the safety net.
     required: false
     default: "fallback"
 
@@ -76,9 +79,21 @@ inputs:
 runs:
   using: "composite"
   steps:
+    # Mode matrix — which step runs in which mode:
+    #
+    #   mode      | gh-pre | nas       | gh-fallback
+    #   --------- | ------ | --------- | -----------
+    #   fallback  | yes    | if pre f. | no
+    #   always    | yes    | yes       | no
+    #   nas-only  | no     | yes       | no
+    #   nas-first | no     | yes (id=nas, continue-on-error) | if nas failed
+    #
+    # gh-pre runs GitHub-first; nas runs in every mode but nas-first uses
+    # continue-on-error so gh-fallback can run if nas fails.
+
     - name: Upload to GitHub Actions artifacts
       id: gh
-      if: ${{ inputs.mode != 'nas-only' }}
+      if: ${{ inputs.mode == 'fallback' || inputs.mode == 'always' }}
       continue-on-error: true
       uses: actions/upload-artifact@v4
       with:
@@ -87,7 +102,14 @@ runs:
         retention-days: ${{ inputs.retention-days }}
         if-no-files-found: ${{ inputs.if-no-files-found }}
 
-    - name: Upload to NAS (rclone SFTP fallback)
+    - name: Upload to NAS (rclone SFTP)
+      id: nas
+      # `continue-on-error: true` only for nas-first — every other mode
+      # treats NAS failure as a hard failure. Composite-step conditional
+      # syntax doesn't support `${{ ... }}` for continue-on-error, so the
+      # value is computed in the if: chain instead: we run the step in
+      # nas-first mode separately with continue-on-error, and in every
+      # other mode normally. Two-block split keeps the contract clean.
       if: >-
         ${{ inputs.mode == 'nas-only' || inputs.mode == 'always' ||
             (inputs.mode == 'fallback' && steps.gh.outcome == 'failure') }}
@@ -211,16 +233,217 @@ runs:
         fi
 
         # --- copy ---
-        RC_FLAGS=(--transfers 4 --retries 3 --low-level-retries 3 --stats-one-line)
+        # Hardened flags (v1.2.0):
+        #   --sftp-concurrency 1                one SSH channel at a time —
+        #                                       avoids hammering sshd
+        #                                       MaxStartups on appliances
+        #                                       (Asustor/Synology default
+        #                                       can be as low as 10:30:100).
+        #   --sftp-disable-concurrent-reads     same on the read side.
+        #   --timeout 30s --contimeout 10s      bound NewFs + transfer hangs.
+        # rclone's own --retries / --low-level-retries cover per-file copy
+        # and per-chunk reads but NOT NewFs() filesystem init — that's
+        # what triggers `NewFs: couldn't initialise SFTP: ... unexpected
+        # EOF` when sshd's queue is exhausted. rclone_retry() below wraps
+        # the whole call to handle init-layer failures.
+        RC_FLAGS=(
+          --transfers 4 --retries 3 --low-level-retries 3
+          --sftp-concurrency 1 --sftp-disable-concurrent-reads
+          --timeout 30s --contimeout 10s
+          --stats-one-line
+        )
+
+        # rclone_retry — wraps an rclone invocation with exponential
+        # backoff specifically for SFTP NewFs failures (server-side queue
+        # exhaustion, mid-handshake EOF, sshd restart races). Backoff:
+        # 1s, 3s, 7s, 15s, 31s (cumulative ~57s across 5 attempts) — long
+        # enough for sshd's MaxStartups queue to drain after a CI burst,
+        # short enough not to balloon a permanently-broken build. Only
+        # retries on init-layer signatures; real errors (auth fail, perm
+        # denied) fail immediately.
+        rclone_retry() {
+          local max_attempts=5 attempt=1 backoff=1 errlog exit_code
+          errlog="$(mktemp)"
+          while [ "$attempt" -le "$max_attempts" ]; do
+            # Capture rclone's exit explicitly in the else-branch. Per
+            # POSIX, `$?` AFTER `if cmd; then …; fi` (no else) is 0 when
+            # the condition was false ("zero, if no condition tested
+            # true"). Without the else, `exit_code=$?` always captured 0,
+            # so rclone_retry returned success on every failure path.
+            if rclone "$@" 2> >(tee "$errlog" >&2); then
+              rm -f "$errlog"
+              return 0
+            else
+              exit_code=$?
+            fi
+            if grep -qE "NewFs:|couldn't initialise SFTP|unexpected EOF|connection reset|version packet from server" "$errlog"; then
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
+                sleep "$backoff"
+                backoff=$((backoff * 2 + 1))
+                attempt=$((attempt + 1))
+                continue
+              fi
+              echo "::error::NAS SFTP init kept failing after ${max_attempts} attempts. Likely sshd MaxStartups exhausted, fail2ban ban, or appliance concurrency cap."
+            fi
+            rm -f "$errlog"
+            return "$exit_code"
+          done
+          rm -f "$errlog"
+          return 1
+        }
+
         for item in "${ITEMS[@]}"; do
           if [ -d "${item}" ]; then
             base="$(basename "${item}")"
             echo "copy dir  ${item} -> ${REMOTE}:${DEST_DIR}/${base}"
-            rclone copy "${item}" "${REMOTE}:${DEST_DIR}/${base}" "${RC_FLAGS[@]}"
+            rclone_retry copy "${item}" "${REMOTE}:${DEST_DIR}/${base}" "${RC_FLAGS[@]}"
           else
             echo "copy file ${item} -> ${REMOTE}:${DEST_DIR}/"
-            rclone copy "${item}" "${REMOTE}:${DEST_DIR}/" "${RC_FLAGS[@]}"
+            rclone_retry copy "${item}" "${REMOTE}:${DEST_DIR}/" "${RC_FLAGS[@]}"
           fi
         done
 
         echo "✅ Artifact '${ART_NAME}' copied to NAS at ${DEST_DIR}"
+
+    # --- nas-first: NAS runs first (above), GitHub as the fallback when
+    #     NAS upload failed. Mirrors the schema fields of the gh-pre step
+    #     so callers can switch modes without changing their `with:` block.
+    - name: Upload to NAS (nas-first variant)
+      id: nas_first
+      if: ${{ inputs.mode == 'nas-first' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        # Same envs as the nas step above. Duplicated because composite
+        # action steps cannot share env blocks via anchors.
+        MODE: ${{ inputs.mode }}
+        ART_NAME: ${{ inputs.name }}
+        ART_PATH: ${{ inputs.path }}
+        IF_NO_FILES: ${{ inputs.if-no-files-found }}
+        IN_HOST: ${{ inputs.nas-host }}
+        IN_USER: ${{ inputs.nas-user }}
+        IN_PASS: ${{ inputs.nas-pass }}
+        IN_PORT: ${{ inputs.nas-port }}
+        IN_DEST: ${{ inputs.nas-dest }}
+        IN_CONF_B64: ${{ inputs.nas-conf-b64 }}
+        IN_REMOTE: ${{ inputs.nas-remote }}
+      run: |
+        # nas-first mode: just re-run the same NAS upload logic with
+        # continue-on-error so the gh-fallback step below can fire on
+        # failure. We don't re-duplicate the whole script here — instead
+        # we set a sentinel that the main nas step honors via mode-check.
+        # In practice the `nas` step above already has the full logic and
+        # runs in every mode EXCEPT nas-first (per its if:). For nas-first
+        # we need that same logic to run with continue-on-error so this
+        # step is the actual nas execution in that mode.
+        # ↓ inlined NAS-upload body, identical to the main nas step.
+        set -uo pipefail   # NOTE: -u + -o pipefail, NOT -e — we want to
+                           # return non-zero on failure for gh-fallback
+                           # to fire, not crash the shell.
+        NAS_CONF_B64="${IN_CONF_B64:-${RCLONE_CONF_B64:-}}"
+        NAS_REMOTE="${IN_REMOTE:-${NAS_REMOTE:-}}"
+        NAS_HOST="${IN_HOST:-${NAS_HOST:-}}"
+        NAS_USER="${IN_USER:-${NAS_USER:-}}"
+        NAS_PASS="${IN_PASS:-${NAS_PASS:-}}"
+        NAS_PORT="${IN_PORT:-${NAS_PORT:-22}}"
+        NAS_DEST="${IN_DEST:-${NAS_DEST:-/artifacts}}"
+
+        if ! command -v rclone >/dev/null 2>&1; then
+          case "$(uname -m)" in
+            x86_64) RC_ARCH=amd64 ;;
+            aarch64|arm64) RC_ARCH=arm64 ;;
+            *) RC_ARCH=amd64 ;;
+          esac
+          case "$(uname -s)" in
+            Linux) RC_OS=linux ;; Darwin) RC_OS=osx ;; *) RC_OS=linux ;;
+          esac
+          RC_TMP="$(mktemp -d)"
+          curl -fsSL "https://downloads.rclone.org/rclone-current-${RC_OS}-${RC_ARCH}.zip" -o "${RC_TMP}/rclone.zip" || exit 1
+          unzip -q "${RC_TMP}/rclone.zip" -d "${RC_TMP}"
+          export PATH="$(dirname "$(find "${RC_TMP}" -type f -name rclone | head -n1)"):${PATH}"
+        fi
+
+        REMOTE=""; CLEANUP_CONF=""
+        if [ -n "${NAS_CONF_B64}" ]; then
+          CONF_FILE="$(mktemp)"; CLEANUP_CONF="${CONF_FILE}"
+          printf '%s' "${NAS_CONF_B64}" | base64 -d > "${CONF_FILE}" && chmod 600 "${CONF_FILE}"
+          export RCLONE_CONFIG="${CONF_FILE}"
+          REMOTE="${NAS_REMOTE:-$(sed -n 's/^\[\(.*\)\]$/\1/p' "${CONF_FILE}" | head -n1)}"
+          [ -z "$REMOTE" ] && { echo "::error::no remote in conf"; exit 1; }
+        elif [ -n "${NAS_HOST}" ] && [ -n "${NAS_USER}" ] && [ -n "${NAS_PASS}" ]; then
+          OBSCURED="$(rclone obscure "${NAS_PASS}")"; echo "::add-mask::${OBSCURED}"
+          export RCLONE_CONFIG_NASFALLBACK_TYPE=sftp
+          export RCLONE_CONFIG_NASFALLBACK_HOST="${NAS_HOST}"
+          export RCLONE_CONFIG_NASFALLBACK_USER="${NAS_USER}"
+          export RCLONE_CONFIG_NASFALLBACK_PORT="${NAS_PORT}"
+          export RCLONE_CONFIG_NASFALLBACK_PASS="${OBSCURED}"
+          export RCLONE_CONFIG_NASFALLBACK_SHELL_TYPE=unix
+          export RCLONE_CONFIG_NASFALLBACK_MD5SUM_COMMAND=none
+          export RCLONE_CONFIG_NASFALLBACK_SHA1SUM_COMMAND=none
+          REMOTE="nasfallback"
+        else
+          echo "::error::No NAS credentials (need nas-conf-b64 OR nas-host+user+pass)."; exit 1
+        fi
+        trap '[ -n "${CLEANUP_CONF}" ] && rm -f "${CLEANUP_CONF}"' EXIT
+
+        DEST_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
+        echo "NAS destination (nas-first): ${REMOTE}:${DEST_DIR}"
+
+        shopt -s nullglob
+        declare -a ITEMS=()
+        while IFS= read -r line; do
+          line="${line//$'\r'/}"; [ -z "${line}" ] && continue
+          for m in ${line}; do [ -e "${m}" ] && ITEMS+=("${m}"); done
+        done <<< "${ART_PATH}"
+
+        if [ "${#ITEMS[@]}" -eq 0 ]; then
+          case "${IF_NO_FILES}" in
+            error)  echo "::error::No files found for path(s): ${ART_PATH}"; exit 1 ;;
+            ignore) echo "No files — ignoring."; exit 0 ;;
+            *)      echo "::warning::No files found for path(s): ${ART_PATH}"; exit 0 ;;
+          esac
+        fi
+
+        RC_FLAGS=(
+          --transfers 4 --retries 3 --low-level-retries 3
+          --sftp-concurrency 1 --sftp-disable-concurrent-reads
+          --timeout 30s --contimeout 10s
+          --stats-one-line
+        )
+        rclone_retry() {
+          local max_attempts=5 attempt=1 backoff=1 errlog exit_code
+          errlog="$(mktemp)"
+          while [ "$attempt" -le "$max_attempts" ]; do
+            # See main rclone_retry above for why the else-branch is required.
+            if rclone "$@" 2> >(tee "$errlog" >&2); then rm -f "$errlog"; return 0; else exit_code=$?; fi
+            if grep -qE "NewFs:|couldn't initialise SFTP|unexpected EOF|connection reset|version packet from server" "$errlog"; then
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
+                sleep "$backoff"; backoff=$((backoff * 2 + 1)); attempt=$((attempt + 1)); continue
+              fi
+              echo "::warning::NAS SFTP kept failing — gh-fallback step will pick this up"
+            fi
+            rm -f "$errlog"; return "$exit_code"
+          done
+          rm -f "$errlog"; return 1
+        }
+
+        for item in "${ITEMS[@]}"; do
+          if [ -d "${item}" ]; then
+            base="$(basename "${item}")"
+            rclone_retry copy "${item}" "${REMOTE}:${DEST_DIR}/${base}" "${RC_FLAGS[@]}" || exit $?
+          else
+            rclone_retry copy "${item}" "${REMOTE}:${DEST_DIR}/" "${RC_FLAGS[@]}" || exit $?
+          fi
+        done
+        echo "✅ Artifact '${ART_NAME}' copied to NAS (nas-first) at ${DEST_DIR}"
+
+    - name: Upload to GitHub Actions artifacts (nas-first fallback)
+      if: ${{ inputs.mode == 'nas-first' && steps.nas_first.outcome == 'failure' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        retention-days: ${{ inputs.retention-days }}
+        if-no-files-found: ${{ inputs.if-no-files-found }}
