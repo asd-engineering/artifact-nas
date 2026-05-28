@@ -191,8 +191,29 @@ runs:
         else
           SRC_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
         fi
-        echo "NAS source: ${REMOTE}:${SRC_DIR} -> ${DEST_PATH}"
-        mkdir -p "${DEST_PATH}"
+        echo "NAS source: ${REMOTE}:${SRC_DIR}"
+
+        # --- parse multi-line DEST_PATH into individual items ---
+        # Mirrors upload/action.yml's per-item iteration. Without this,
+        # multi-line `path:` ended up dumped under DEST_PATH's first line.
+        declare -a ITEMS=()
+        while IFS= read -r line; do
+          line="${line//$'\r'/}"
+          [ -z "${line}" ] && continue
+          for m in ${line}; do
+            # ~ expansion — bash doesn't expand it inside quoted strings.
+            case "${m}" in
+              "~/"*) m="${HOME}/${m#~/}" ;;
+              "~")   m="${HOME}" ;;
+            esac
+            ITEMS+=("${m}")
+          done
+        done <<< "${DEST_PATH}"
+        # Empty input: behave like the legacy single-target download (root = ".")
+        if [ "${#ITEMS[@]}" -eq 0 ]; then
+          ITEMS=(".")
+        fi
+        echo "Restore targets: ${ITEMS[*]}"
 
         # Hardened flags (v1.2.0):
         #   --sftp-concurrency 1                  one SSH channel at a time —
@@ -239,28 +260,66 @@ runs:
           rm -f "$errlog"
           return 1
         }
-        # `cache` mode tolerates the source not existing — cache miss is
-        # not an error, just means a prior run hasn't populated this key
-        # yet (or the key changed because inputs changed). For non-cache
-        # modes, missing source IS an error (the upload should have run
-        # before us in the same workflow).
-        if [ "${MODE}" = "cache" ]; then
-          rclone_retry copy "${REMOTE}:${SRC_DIR}" "${DEST_PATH}" "${RC_FLAGS[@]}" || {
-            echo "NAS cache miss: ${ART_NAME} (no files at ${SRC_DIR})"
-            exit 0
-          }
-          if [ -z "$(ls -A "${DEST_PATH}" 2>/dev/null)" ]; then
-            echo "NAS cache miss: ${ART_NAME} (empty at ${SRC_DIR})"
-            exit 0
+        # --- list the SRC_DIR once to learn what's there ---
+        # We use this listing to (a) detect cache miss cheaply (one query
+        # instead of one-failed-copy-per-item) and (b) distinguish files
+        # from directories so we can mirror the upload-side layout — a
+        # directory `node_modules` was uploaded as `<SRC_DIR>/node_modules/`,
+        # so we restore by copying `<SRC_DIR>/node_modules` (a dir) INTO
+        # the local `node_modules` dir (rclone copies CONTENTS). A file
+        # `.env` was uploaded as `<SRC_DIR>/.env`, restored by copying
+        # the remote file into its local PARENT (rclone copy file → dir
+        # uses the file's basename for the destination filename).
+        #
+        # `lsf --max-depth 1` lists immediate children; entries ending in
+        # `/` are dirs, otherwise files. Empty output = cache-miss (the
+        # SRC_DIR doesn't exist on the remote). `|| true` because lsf on
+        # a missing remote dir exits non-zero — that's the cache-miss
+        # signal in `mode: cache`, and a hard error elsewhere (handled
+        # via the ANY_HIT check below).
+        REMOTE_LISTING="$(rclone_retry lsf --max-depth 1 "${REMOTE}:${SRC_DIR}/" "${RC_FLAGS[@]}" 2>/dev/null || true)"
+
+        # --- restore each item ---
+        ANY_HIT=0
+        for item in "${ITEMS[@]}"; do
+          base="$(basename "${item}")"
+          parent="$(dirname "${item}")"
+          mkdir -p "${parent}"
+          if echo "${REMOTE_LISTING}" | grep -qFx "${base}/"; then
+            # Source is a directory → restore CONTENTS into ${item}
+            mkdir -p "${item}"
+            if rclone_retry copy "${REMOTE}:${SRC_DIR}/${base}" "${item}" "${RC_FLAGS[@]}"; then
+              [ -n "$(ls -A "${item}" 2>/dev/null)" ] && ANY_HIT=1
+            fi
+          elif echo "${REMOTE_LISTING}" | grep -qFx "${base}"; then
+            # Source is a single file → drop into ${parent} (rclone uses
+            # the source's basename for the resulting filename).
+            if rclone_retry copy "${REMOTE}:${SRC_DIR}/${base}" "${parent}" "${RC_FLAGS[@]}"; then
+              [ -e "${item}" ] && ANY_HIT=1
+            fi
           fi
-          echo "✅ NAS cache HIT: ${ART_NAME} -> ${DEST_PATH}"
+          # else: item not present on remote → skip silently. In `mode:
+          # cache` that's a partial miss (one item not in cache, others
+          # may still be). In non-cache modes we error below if NOTHING
+          # was restored.
+        done
+
+        # --- outcome ---
+        # `cache` mode tolerates the source not existing — cache miss is
+        # not an error, just means a prior run hasn't populated this key.
+        # For non-cache modes, missing source IS an error (the upload
+        # should have run before us in the same workflow).
+        if [ "${MODE}" = "cache" ]; then
+          if [ "${ANY_HIT}" -eq 1 ]; then
+            echo "✅ NAS cache HIT: ${ART_NAME} -> ${ITEMS[*]}"
+          else
+            echo "NAS cache miss: ${ART_NAME} (nothing under ${SRC_DIR})"
+          fi
           exit 0
         fi
 
-        rclone_retry copy "${REMOTE}:${SRC_DIR}" "${DEST_PATH}" "${RC_FLAGS[@]}"
-
-        if [ -z "$(ls -A "${DEST_PATH}" 2>/dev/null)" ]; then
+        if [ "${ANY_HIT}" -eq 0 ]; then
           echo "::error::NAS download produced no files from ${REMOTE}:${SRC_DIR}" >&2
           exit 1
         fi
-        echo "✅ Artifact '${ART_NAME}' downloaded from NAS -> ${DEST_PATH}"
+        echo "✅ Artifact '${ART_NAME}' downloaded from NAS -> ${ITEMS[*]}"
