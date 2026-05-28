@@ -279,7 +279,42 @@ runs:
         # via the ANY_HIT check below).
         REMOTE_LISTING="$(rclone_retry lsf --max-depth 1 "${REMOTE}:${SRC_DIR}/" "${RC_FLAGS[@]}" 2>/dev/null || true)"
 
-        # --- restore each item ---
+        # --- LEGACY single-target case ----------------------------------
+        # `path: .` (or any single root-like destination) means "dump
+        # everything in SRC_DIR into this dir". This matches the v1.4.1
+        # contract and is what windows-ci.yml's `Download pre-generated
+        # build resources` step relies on — it ships 3 files
+        # (symbols.json + tpl-defaults.json + skills.json) and the
+        # consumer just wants them placed at the repo root.
+        #
+        # Detection: a single item that is `.`, `./`, `/`, or empty.
+        # For these, fall through to the legacy single-rclone-copy path.
+        if [ "${#ITEMS[@]}" -eq 1 ]; then
+          single="${ITEMS[0]}"
+          case "${single}" in
+            "." | "./" | "/" | "")
+              mkdir -p "${single:-.}"
+              if rclone_retry copy "${REMOTE}:${SRC_DIR}" "${single:-.}" "${RC_FLAGS[@]}"; then
+                if [ -n "$(ls -A "${single:-.}" 2>/dev/null)" ]; then
+                  if [ "${MODE}" = "cache" ]; then
+                    echo "✅ NAS cache HIT: ${ART_NAME} -> ${single}"
+                  else
+                    echo "✅ Artifact '${ART_NAME}' downloaded from NAS -> ${single}"
+                  fi
+                  exit 0
+                fi
+              fi
+              if [ "${MODE}" = "cache" ]; then
+                echo "NAS cache miss: ${ART_NAME} (no files under ${SRC_DIR})"
+                exit 0
+              fi
+              echo "::error::NAS download produced no files from ${REMOTE}:${SRC_DIR}" >&2
+              exit 1
+              ;;
+          esac
+        fi
+
+        # --- per-item restore (multi-line path OR single named target) ---
         ANY_HIT=0
         for item in "${ITEMS[@]}"; do
           base="$(basename "${item}")"
