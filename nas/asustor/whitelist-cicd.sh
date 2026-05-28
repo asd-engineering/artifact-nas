@@ -28,6 +28,17 @@
 #                        192.168.2.0/24, public IP: 88.159.241.238).
 #                        For a typical CI setup this is the only flag
 #                        you need.
+#   --cidr-mode MODE     How to write CIDR ranges (v1.4.0+):
+#                          auto    — default; netmask form for /<max-expand>+,
+#                                    individual IPs for ≤ /<max-expand>
+#                          expand  — always individual IPs (safest; bloats)
+#                          netmask — always single netmask line per CIDR
+#                                    (EXPERIMENTAL — verify on YOUR ADM
+#                                    version; defender.safe netmask matching
+#                                    is undocumented by Asustor)
+#   --max-expand N       Threshold for auto/expand. Default 24 (/24 = 256
+#                        IPs). Below threshold: per-IP. Above (with auto):
+#                        netmask form. Above (with expand): skipped + warning.
 #   --dry-run            (default) Print proposed defender.safe lines to
 #                        stdout; do NOT write.
 #   --apply              Append non-duplicate lines to
@@ -35,12 +46,6 @@
 #                        root / sudo on the NAS.
 #   --out PATH           Override target file (testing). Default
 #                        /usr/builtin/etc/ipblock/defender.safe.
-#   --max-expand N       Skip CIDRs larger than /N when expanding to
-#                        individual IPs. Default 24 (i.e. expand /24 →
-#                        256 IPs; skip /16 → 65536 IPs with a warning).
-#                        The Asustor defender.safe format only takes
-#                        individual <ip>;<netmask>;<flag> lines; netmask-
-#                        based CIDR support is version-dependent (TODO).
 #
 # Examples:
 #   # COMMON CASE — whitelist your self-hosted runner LAN + public IP
@@ -71,6 +76,17 @@ CUSTOM=""
 MODE="dry-run"
 OUT="/usr/builtin/etc/ipblock/defender.safe"
 MAX_EXPAND=24
+# CIDR-emission strategy:
+#   expand  — every CIDR → individual <ip>;0.0.0.0;0 lines
+#             (always works on every ADM version; bloats for /16+)
+#   netmask — every CIDR → single <network>;<netmask>;0 line
+#             (EXPERIMENTAL — Asustor defender.safe netmask matching is
+#             undocumented; existing entries all use 0.0.0.0 single-IP
+#             form. Test on YOUR ADM version before trusting.)
+#   auto    — netmask for CIDRs > /<max-expand>, expand for ≤
+#             (DEFAULT, balances size + safety: small ranges stay in
+#             the proven single-IP form, big ones use netmask)
+CIDR_MODE="auto"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -80,6 +96,7 @@ while [ "$#" -gt 0 ]; do
     --apply)      MODE="apply"; shift ;;
     --out)        OUT="$2"; shift 2 ;;
     --max-expand) MAX_EXPAND="$2"; shift 2 ;;
+    --cidr-mode)  CIDR_MODE="$2"; shift 2 ;;
     -h|--help)    sed -n '1,/^set -eu/p' "$0" | grep -E '^#( |$)' | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)            echo "::error::unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -123,29 +140,28 @@ fetch_gitlab_cidrs() {
 EOF
 }
 
-# --- CIDR expansion --------------------------------------------------------
+# --- CIDR → defender.safe line emitters -----------------------------------
+# Two strategies, picked per-CIDR by `cidr_to_lines` based on $CIDR_MODE
+# and the CIDR's prefix length:
+#
+#   - cidr_expand_to_ips   one <ip>;0.0.0.0;0 line PER host IP (always
+#                          works on every ADM version; bloats for /16+)
+#   - cidr_to_netmask_line single <network>;<netmask>;0 line per CIDR
+#                          (EXPERIMENTAL — netmask matching in
+#                          defender.safe is undocumented; existing
+#                          entries on shipping ADM all use 0.0.0.0)
+#
+# POSIX-sh-friendly; awk for bit math (POSIX awk lacks bitwise ops on
+# some implementations, so we provide portable bshl/band).
 
-# Convert CIDR to individual IPv4 host addresses. POSIX-shell-friendly;
-# uses awk for the bit math (POSIX awk lacks bitwise ops on some
-# implementations, so we provide portable bshl/and macros).
-cidr_expand() {
+cidr_expand_to_ips() {
   cidr="$1"
   case "$cidr" in
     */*)  ip="${cidr%/*}"; mask="${cidr#*/}" ;;
     *)    ip="$cidr"; mask="32" ;;
   esac
-  case "$ip" in
-    *:*) echo "::warning::ipv6 not supported, skipping: $cidr" >&2; return 0 ;;
-  esac
-  if [ "$mask" -eq 32 ]; then echo "$ip"; return 0; fi
-  if [ "$mask" -lt "$MAX_EXPAND" ]; then
-    SIZE=1
-    HOSTBITS=$((32 - mask))
-    i=0
-    while [ "$i" -lt "$HOSTBITS" ]; do SIZE=$((SIZE * 2)); i=$((i+1)); done
-    echo "::warning::CIDR ${cidr} is larger than /${MAX_EXPAND} (${SIZE} IPs) — skipping; widen --max-expand to include it" >&2
-    return 0
-  fi
+  case "$ip" in *:*) return 0 ;; esac
+  if [ "$mask" -eq 32 ]; then echo "${ip};0.0.0.0;0"; return 0; fi
   awk -v ip="$ip" -v mask="$mask" '
     function bshl(v, n) { while (n-- > 0) v *= 2; return v }
     function band(a, b,   r, p) {
@@ -164,18 +180,84 @@ cidr_expand() {
       base = band(ipi, bshl(0xFFFFFFFF, hostbits))
       for (i = 0; i < size; i++) {
         x = base + i
-        printf "%d.%d.%d.%d\n", int(x/16777216)%256, int(x/65536)%256, int(x/256)%256, int(x)%256
+        printf "%d.%d.%d.%d;0.0.0.0;0\n", int(x/16777216)%256, int(x/65536)%256, int(x/256)%256, int(x)%256
       }
     }
   '
 }
 
+cidr_to_netmask_line() {
+  cidr="$1"
+  case "$cidr" in
+    */*)  ip="${cidr%/*}"; mask="${cidr#*/}" ;;
+    *)    ip="$cidr"; mask="32" ;;
+  esac
+  case "$ip" in *:*) return 0 ;; esac
+  awk -v ip="$ip" -v mask="$mask" '
+    function bshl(v, n) { while (n-- > 0) v *= 2; return v }
+    function band(a, b,   r, p) {
+      r = 0; p = 1
+      while (a > 0 || b > 0) {
+        if ((a % 2 == 1) && (b % 2 == 1)) r += p
+        a = int(a / 2); b = int(b / 2); p *= 2
+      }
+      return r
+    }
+    BEGIN {
+      split(ip, a, ".")
+      ipi = a[1]*16777216 + a[2]*65536 + a[3]*256 + a[4]
+      hostbits = 32 - mask
+      base = band(ipi, bshl(0xFFFFFFFF, hostbits))
+      netmask = bshl(0xFFFFFFFF, hostbits) % 4294967296
+      printf "%d.%d.%d.%d;%d.%d.%d.%d;0\n", \
+        int(base/16777216)%256, int(base/65536)%256, int(base/256)%256, int(base)%256, \
+        int(netmask/16777216)%256, int(netmask/65536)%256, int(netmask/256)%256, int(netmask)%256
+    }
+  '
+}
+
+# Dispatcher: per --cidr-mode + per-CIDR-size, pick the emitter.
+# Returns lines on stdout in the defender.safe wire format.
+cidr_to_lines() {
+  cidr="$1"
+  case "$cidr" in
+    */*)  mask="${cidr#*/}" ;;
+    *)    mask="32" ;;
+  esac
+  case "$cidr" in *:*) echo "::warning::ipv6 not supported, skipping: $cidr" >&2; return 0 ;; esac
+
+  case "$CIDR_MODE" in
+    expand)
+      # Force per-IP enumeration. Skip if larger than --max-expand.
+      if [ "$mask" -lt "$MAX_EXPAND" ]; then
+        echo "::warning::CIDR ${cidr} > /${MAX_EXPAND}; skipping (--cidr-mode=expand). Use --cidr-mode=netmask or widen --max-expand." >&2
+        return 0
+      fi
+      cidr_expand_to_ips "$cidr"
+      ;;
+    netmask)
+      # Single netmask line per CIDR. Works for any size; UNTESTED on
+      # Asustor — if it doesn't match, fall back to --cidr-mode=auto.
+      cidr_to_netmask_line "$cidr"
+      ;;
+    auto|*)
+      # Expand small CIDRs (well-tested individual-IP form);
+      # netmask the big ones (experimental but the only way to fit).
+      if [ "$mask" -ge "$MAX_EXPAND" ]; then
+        cidr_expand_to_ips "$cidr"
+      else
+        cidr_to_netmask_line "$cidr"
+      fi
+      ;;
+  esac
+}
+
 # --- build the candidate set -----------------------------------------------
 
 TMP_RAW="$(mktemp)"
-TMP_IPS="$(mktemp)"
+# TMP_IPS removed (v1.4 — cidr_to_lines emits final form directly)
 TMP_LINES="$(mktemp)"
-trap 'rm -f "$TMP_RAW" "$TMP_IPS" "$TMP_LINES"' EXIT
+trap 'rm -f "$TMP_RAW" "$TMP_LINES"' EXIT
 
 OLD_IFS="$IFS"
 IFS=','
@@ -199,17 +281,19 @@ if [ ! -s "$TMP_RAW" ]; then
 fi
 
 CIDR_COUNT=$(wc -l < "$TMP_RAW" | tr -d ' ')
-echo "→ expanding ${CIDR_COUNT} CIDRs to individual IPs (--max-expand /${MAX_EXPAND})..." >&2
+case "$CIDR_MODE" in
+  expand)  echo "→ emitting ${CIDR_COUNT} CIDRs as individual IPs (--cidr-mode=expand, --max-expand /${MAX_EXPAND})..." >&2 ;;
+  netmask) echo "→ emitting ${CIDR_COUNT} CIDRs as single netmask lines (--cidr-mode=netmask; EXPERIMENTAL — verify Asustor honors netmask matching)" >&2 ;;
+  auto|*)  echo "→ emitting ${CIDR_COUNT} CIDRs in auto mode (expand for /${MAX_EXPAND}+, netmask for larger)..." >&2 ;;
+esac
 
 while IFS= read -r cidr; do
   [ -z "$cidr" ] && continue
-  cidr_expand "$cidr"
-done < "$TMP_RAW" | sort -u > "$TMP_IPS"
+  cidr_to_lines "$cidr"
+done < "$TMP_RAW" | sort -u > "$TMP_LINES"
 
-IPCOUNT=$(wc -l < "$TMP_IPS" | tr -d ' ')
-echo "→ ${IPCOUNT} unique IPs to consider" >&2
-
-awk '{print $1 ";0.0.0.0;0"}' "$TMP_IPS" > "$TMP_LINES"
+LINE_COUNT=$(wc -l < "$TMP_LINES" | tr -d ' ')
+echo "→ ${LINE_COUNT} unique defender.safe lines produced" >&2
 
 # --- diff against existing + apply ----------------------------------------
 
@@ -217,9 +301,9 @@ if [ "$MODE" = "dry-run" ]; then
   if [ -r "$OUT" ]; then
     NEW=$(comm -23 "$TMP_LINES" "$(sort -u "$OUT" > /tmp/.wl-existing-$$ && echo /tmp/.wl-existing-$$)" 2>/dev/null | wc -l | tr -d ' ')
     rm -f /tmp/.wl-existing-$$
-    echo "→ would add ${NEW} new entries to ${OUT} (${IPCOUNT} candidates, $((IPCOUNT - NEW)) already present)" >&2
+    echo "→ would add ${NEW} new entries to ${OUT} (${LINE_COUNT} candidates, $((LINE_COUNT - NEW)) already present)" >&2
   else
-    echo "→ ${OUT} does not exist yet — would create with ${IPCOUNT} entries" >&2
+    echo "→ ${OUT} does not exist yet — would create with ${LINE_COUNT} entries" >&2
   fi
   echo "→ preview (first 20 lines that would land in ${OUT}):" >&2
   head -20 "$TMP_LINES"
