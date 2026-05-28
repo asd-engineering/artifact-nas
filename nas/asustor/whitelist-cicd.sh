@@ -345,12 +345,18 @@ fi
 chmod 644 "$OUT" 2>/dev/null || true
 echo "✅ wrote ${OUT} (total entries: $(wc -l < "$OUT" | tr -d ' '))"
 
-# Reload ipblock daemon — best effort (script name varies across ADM versions)
-echo "→ attempting ipblockd reload (best-effort)..."
-{ killall -HUP ipblockd 2>/dev/null && echo "  ✅ sent SIGHUP to ipblockd"; } \
+# Reload the daemon so the new defender.safe takes effect immediately.
+# On AS6706T / ADM 4.x the daemon is `/usr/builtin/sbin/defenderd`
+# (verified via `ps -ef` — NOT `ipblockd` as some older guides claim).
+# SIGHUP reloads config without restart. Keep ipblockd-named fallbacks
+# for older ADM versions; final fallback is the manual ADM-web-UI note.
+echo "→ attempting defenderd reload (best-effort)..."
+{ killall -HUP defenderd 2>/dev/null && echo "  ✅ sent SIGHUP to defenderd (config reloaded)"; } \
+  || { killall -HUP ipblockd 2>/dev/null && echo "  ✅ sent SIGHUP to ipblockd (older ADM)"; } \
+  || { /etc/init.d/defenderd restart 2>/dev/null && echo "  ✅ restarted via /etc/init.d/defenderd"; } \
   || { /etc/init.d/ipblockd restart 2>/dev/null && echo "  ✅ restarted via /etc/init.d/ipblockd"; } \
-  || { /usr/builtin/etc.init.d/ipblockd restart 2>/dev/null && echo "  ✅ restarted via /usr/builtin/etc.init.d/ipblockd"; } \
-  || echo "  ⚠️  could not auto-reload — toggle Defender off+on in the ADM web UI, OR reboot, to apply"
+  || { /usr/builtin/etc.init.d/defenderd restart 2>/dev/null && echo "  ✅ restarted via /usr/builtin/etc.init.d/defenderd"; } \
+  || echo "  ⚠️  could not auto-reload — toggle Defender off+on in the ADM web UI (Settings → ADM Defender), OR reboot, to apply"
 
 echo
 echo "Done. Verify a runner IP can now connect cleanly:"
