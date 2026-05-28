@@ -222,20 +222,28 @@ symbol at 551254). Source: `strings /usr/bin/sshd-session | grep -B1 administrat
 When a user connects, sshd checks group membership against this
 hardcoded value EVEN IF the config has `AllowGroups` set to something
 else (the patch checks BOTH). Any user not in the UNIX `administrators`
-group (`/etc/group: administrators:x:999:admin,sysadmin`) gets:
+group (`/etc/group: administrators:x:999:admin,sysadmin`) gets treated
+as `NOUSER` (anti-enumeration downgrade) and rejected at auth.
 
-1. Treated as `NOUSER` (anti-enumeration downgrade)
-2. Authentication "fails" — every method
-3. The cleanup-on-failed-auth code path calls `unlink()` on a temp/lock file
-4. OpenSSH's seccomp filter doesn't allow `unlink` in preauth → SIGSYS
-5. Child crashes; PerSourcePenalties keeps subsequent connections out
-6. Eventually the service supervisor SIGTERMs the master listener
-7. SFTP service "is offline" from the outside
+**Note (corrected 2026-05-28 evening)**: An earlier revision of this
+file claimed the AllowGroups patch ALSO fixes the SIGSYS / unlink
+crashes. That was wrong. The two are independent:
+
+- **DefaultAllowGroups patch** (`patch-sshd-session.py`) — fixes user
+  rejection. The `users`-group user can now authenticate.
+- **Seccomp default-action patch** (`patch-seccomp.py`) — fixes the
+  unrelated SIGSYS-on-`unlink`. The unlink call lives in OpenSSH's
+  preauth privsep monitor cleanup and fires for **every** session,
+  not just NOUSER-rejected ones. Stock OpenSSH 9.8p1's seccomp filter
+  doesn't allow `unlink` (syscall 87 on x86_64) → child crashes →
+  `PerSourcePenalties` drops further connections → eventually the
+  Asustor service supervisor SIGTERMs the master listener and port
+  4589 disappears off the network.
 
 So the visible-from-outside symptom is `connection refused` /
 `connection reset by peer` from rclone, the visible-on-NAS symptom is
-the SIGSYS audits + sshd master flapping. Both are downstream of one
-hardcoded string in the patched binary.
+the SIGSYS audits + sshd master flapping. **You need both patches** to
+permanently fix this — one is a no-op for the other's issue.
 
 ## The fix — `patch-sshd-session.py`
 
@@ -254,8 +262,6 @@ After patching:
 - Users in `users` group (the default primary group for Asustor users
   created via ADM UI) pass the AllowGroups check
 - Auth proceeds normally — key or password
-- No more SIGSYS kills (the cleanup-after-NOUSER-rejection code path
-  is never entered for normal users)
 - UNIX `administrators` group membership is STILL meaningful for sudo
   + ADM admin role (other `administrators` references in the binary,
   the `%administrators ALL=(ALL:ALL) ALL` sudoers line, and
@@ -264,11 +270,78 @@ After patching:
 Reversal: `sudo cp /usr/bin/sshd-session.asustor-original /usr/bin/sshd-session`
 (the script auto-backs up before patching).
 
+## Companion fix — `patch-seccomp.py` (the SIGSYS crashes)
+
+After the AllowGroups patch lands, you may still see periodic SIGSYS
+crashes in the `sshd-session` audit log:
+
+```
+kernel: audit: type=1326 comm="sshd-session" sig=31 syscall=87 (unlink)
+sshd-session: error: mm_reap: preauth child terminated by signal 31
+sshd[N]: Session process X unpriv child crash for connection from ...
+sshd[N]: drop connection #0 ... penalty: caused crash
+```
+
+These come from a separate problem: OpenSSH 9.8p1's preauth privsep
+seccomp filter doesn't allow `unlink` (syscall 87), but **something
+in the Asustor build's preauth path calls it** (likely a privsep IPC
+cleanup, possibly a `shm_unlink` reduced to `unlink` under the
+appliance's libc). Every Nth session crashes; PerSourcePenalties
+escalates that to "drop all from this IP" within a few minutes.
+
+### The fix
+
+`patch-seccomp.py` flips the BPF filter's default action from
+`SECCOMP_RET_KILL_THREAD` (the `KILL` at file offset **0x90988**, the
+LAST `RET` instruction of the filter) to `SECCOMP_RET_ALLOW`. This is
+a single 4-byte change to the instruction's `k` field.
+
+```bash
+sudo python3 nas/asustor/patch-seccomp.py
+sudo /usr/builtin/etc/init.d/S79sftpmand stop
+sudo /usr/builtin/etc/init.d/S79sftpmand start
+```
+
+What stays intact:
+
+- The **arch-mismatch kill** at offset 0x90350 (the first `RET KILL`,
+  guarding against x86_64-ABI mismatch) — kept, important safety check.
+- All **explicit `SC_DENY`** rules returning `EACCES` for `open`,
+  `openat`, `lstat`, `fstat`, `newfstatat`, `stat`, `shmget`, `shmat`,
+  `shmdt`, `statx`, `brk` — these continue to deny what they always did.
+- All **explicit `SC_ALLOW`** rules for ~100 syscalls — unchanged.
+
+What changes:
+
+- Implicit-default for "syscall not listed" flips from `KILL` to
+  `ALLOW`. The privsep monitor child still runs setuid-restricted +
+  chrooted; the seccomp belt is loosened only on the "unspecified
+  syscall" axis.
+
+The patch uses **write-to-tmp + atomic rename** to dodge `ETXTBSY`
+("Text file busy") on live sshd-session children — running children
+keep the old inode; fresh `execve()`s pick up the new one. Backs up
+to `/usr/bin/sshd-session.before-seccomp-patch` on first run.
+
+Reversal: `sudo cp /usr/bin/sshd-session.before-seccomp-patch /usr/bin/sshd-session`
+(but you'll lose the AllowGroups fix too — that backup is from before
+either patch; if both were applied, restore the layered backups in
+reverse order).
+
 ## **Required after firmware updates**
 
-Asustor firmware updates may replace `/usr/bin/sshd-session`. The
-`patch-sshd-session.py` script is idempotent — re-run it after any
-ADM upgrade. Add it to your post-upgrade checklist.
+Asustor firmware updates may replace `/usr/bin/sshd-session`. Both
+patch scripts are idempotent — re-run them in order after any ADM
+upgrade. Add to your post-upgrade checklist:
+
+```bash
+sudo python3 nas/asustor/patch-sshd-session.py   # AllowGroups
+sudo python3 nas/asustor/patch-seccomp.py        # SIGSYS default-action
+sudo /usr/builtin/etc/init.d/S79sftpmand stop; sleep 1
+sudo /usr/builtin/etc/init.d/S79sftpmand start
+sudo killall -HUP sshd 2>/dev/null               # clear PerSourcePenalties
+ss -tlnp | grep -E ':4589|:2324'                 # verify both ports listen
+```
 
 ---
 
@@ -284,7 +357,8 @@ else is per-user.
 | 2. Verify primary GID | NAS | `id <user>` should show `gid=100(users)` |
 | 3. Prepare `.ssh` dir | NAS | `sudo install -d -m 700 -o <user> -g users /home/<user>/.ssh` |
 | 4. Drop pubkey | NAS | `sudo tee /home/<user>/.ssh/authorized_keys < your-key.pub; sudo chown <user>:users /home/<user>/.ssh/authorized_keys; sudo chmod 600 /home/<user>/.ssh/authorized_keys` |
-| 5. Verify binary patched | NAS (one-time) | `grep -aboF "DefaultAllowGroups" /usr/bin/sshd-session; sudo python3 patch-sshd-session.py` (no-op if already patched) |
+| 5a. AllowGroups binary patch | NAS (one-time per appliance, idempotent) | `sudo python3 patch-sshd-session.py` — flips hardcoded `administrators` → `users` |
+| 5b. Seccomp default-action patch | NAS (one-time per appliance, idempotent) | `sudo python3 patch-seccomp.py` — flips BPF default `KILL_THREAD` → `ALLOW`; fixes the independent SIGSYS-on-`unlink` crashes that survive 5a |
 | 6. Generate rclone profile | Local | Use the inline `key_pem` form so it ships in ONE secret. See template below. |
 | 7. Push RCLONE_CONF_B64 | Local | `base64 -w0 rclone.conf \| gh secret set RCLONE_CONF_B64 --org <ORG> --visibility all` |
 | 8. Push NAS_DEST | Local | `echo "/home/<user>/ci-artifacts" \| gh secret set NAS_DEST --org <ORG> --visibility all` (NOTE: lowercase `/home/...` — `/Home` is NOT a valid path on most Asustor builds) |
@@ -324,7 +398,16 @@ with `syscall=87` (unlink), it is tempting to fix:
 - `pam_google_authenticator` required → make optional
 - `UsePAM yes` → `UsePAM no`
 - `ipblockman` syscalls → no-op shim
+- `PrintLastLog no` in `sshd_config_sftp`
 
-**Don't.** Each of those scratches one surface symptom and leaves the
-real bug (DefaultAllowGroups rejection → cleanup unlink → SIGSYS) in
-place. Patch the binary, leave the rest alone.
+**Don't.** Each scratches one surface symptom but the real bugs are
+in the binary itself:
+
+1. Hardcoded `DefaultAllowGroups = "administrators"` rejects non-admin
+   users — fixed by `patch-sshd-session.py`.
+2. Preauth seccomp filter doesn't allow `unlink` — fixed by
+   `patch-seccomp.py`. The unlink call is in OpenSSH's privsep monitor
+   cleanup path; it runs for every session regardless of auth outcome.
+
+Patch BOTH, leave the rest alone. Configuration tweaks on the periphery
+mask the symptoms transiently and rot back on the next ADM update.
