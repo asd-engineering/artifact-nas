@@ -136,3 +136,69 @@ After applying the whitelist:
    `kex_exchange_identification: read: Connection reset by peer`.
 3. Check `/usr/builtin/etc/ipblock/abuseip.deny` (the deny list) to see
    it does NOT contain your runner's IP.
+
+---
+
+# SFTP daemon crash-loop — OpenSSH seccomp + missing `/var/log/lastlog`
+
+A second, independent failure mode on Asustor 4.2.5.RN33+ firmware that
+also surfaces to `artifact-nas` users as "NAS is unreachable":
+
+```
+sshd-session: error: mm_reap: preauth child terminated by signal 31
+kernel audit: comm="sshd-session" sig=31 syscall=87 code=0x0
+```
+
+**Root cause:** `PrintLastLog yes` (default in `sshd_config_sftp`) makes
+OpenSSH's preauth privsep child write to `/var/log/lastlog`. On recent
+Asustor builds that file does not exist; OpenSSH's write path includes
+`unlink(2)` (syscall 87 on x86_64) which is NOT in the preauth seccomp
+filter's allowlist. The kernel kills the child with `SIGSYS` (signal 31).
+Every connection crashes. OpenSSH's `PerSourcePenalties` (built into
+9.8+) starts dropping further connections from the same source IP with
+`penalty: caused crash`. Eventually the Asustor service supervisor
+SIGTERMs the master sshd because too many children died — the listener
+disappears off port 4589 and `artifact-nas` uploads get
+`connection refused`. From the client side this looks identical to
+ipblock having banned the runner — but it's a different problem at a
+different layer.
+
+## Asustor has TWO SFTP config files
+
+```
+/usr/builtin/etc.default/sshd_config_sftp   ← defaults; firmware updates restore from here
+/usr/builtin/etc/sshd_config_sftp           ← runtime; what the daemon actually reads
+```
+
+Patching only the runtime works until the next firmware update, which
+may copy defaults → runtime and undo your fix. `fix-sftp-seccomp-crash.sh`
+patches BOTH and adds a `@reboot` cron guard that recreates the lastlog
+file even if it gets wiped by future updates.
+
+## Usage
+
+```bash
+# Apply the persistent fix (writes backups; idempotent — safe to re-run):
+sudo sh fix-sftp-seccomp-crash.sh
+
+# Inspect current state, no changes:
+sudo sh fix-sftp-seccomp-crash.sh --check
+
+# After running + a few new connections, confirm no new seccomp kills:
+sudo sh fix-sftp-seccomp-crash.sh --verify
+```
+
+The fix restarts the SFTP service via `/usr/bin/serviceutil sshd
+restart` (Asustor's CLI service tool — bypasses the ADM web UI toggle,
+which is unreliable when the service is in the crash-loop).
+
+## How this relates to the ipblock whitelist
+
+Different problems, both produce "NAS unreachable" to `artifact-nas`:
+
+| Layer | Symptom (client-side) | Symptom (NAS-side) | Fix |
+|---|---|---|---|
+| ipblock IP-ban | `Connection reset by peer` during kex | `Failed publickey` in defenderd logs | `whitelist-cicd.sh` |
+| seccomp crash | `Connection refused` (port closed) | `sig=31 syscall=87` in dmesg | `fix-sftp-seccomp-crash.sh` |
+
+Run both if you've seen either symptom — they don't conflict.
