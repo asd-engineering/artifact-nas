@@ -49,9 +49,11 @@ Each line is `<ip>;<netmask>;<flag>`. Example:
 ```
 
 - `<ip>` — IPv4 dotted-quad
-- `<netmask>` — `0.0.0.0` for single host. CIDR support via netmask is
-  appliance-version-dependent — test on your unit. The included script
-  emits `0.0.0.0` per IP (safest, always works).
+- `<netmask>` — `0.0.0.0` for single host (the form every shipped ADM
+  uses). Asustor's netmask-matching (e.g. `255.255.255.0` for /24,
+  `255.255.0.0` for /16) is undocumented and version-dependent. The
+  script can emit either form (`--cidr-mode expand` vs `--cidr-mode
+  netmask`); default `auto` blends them — see below.
 - `<flag>` — observed value is always `0` in the wild; semantics
   undocumented by Asustor.
 
@@ -59,19 +61,34 @@ Each line is `<ip>;<netmask>;<flag>`. Example:
 
 ### Option A — Whitelist runner IPs (recommended for CI)
 
-Run `whitelist-cicd.sh --apply` (locally on the NAS) or pipe it via SSH
-from a workstation that already has a non-banned login. It fetches
-GitHub Actions IP ranges (live, via `api.github.com/meta`), the
-documented GitLab.com runner ranges, and any custom IPs you provide,
-then expands them to individual `<ip>;0.0.0.0;0` lines and appends to
-`defender.safe` (idempotent — won't duplicate existing entries).
+Run `whitelist-cicd.sh` (locally on the NAS) or pipe it via SSH from
+a workstation that already has a non-banned login. It supports CIDRs
+via `--custom` and can also fetch GitHub Actions / GitLab.com hosted-
+runner IP ranges via `--include`. Three CIDR-emission modes:
+
+| `--cidr-mode` | What gets written per CIDR | When to use |
+|---|---|---|
+| `auto` (default) | `≤ /<max-expand>` → individual IPs; `> /<max-expand>` → single netmask line | Safe + compact. Default `--max-expand 24`. |
+| `expand` | Always individual `<ip>;0.0.0.0;0` lines | Maximum safety; bloats for `/16+` (skips them with warning) |
+| `netmask` | Always single `<network>;<netmask>;0` line | Compact; EXPERIMENTAL — verify your ADM version honors netmask matching by trying a small CIDR first |
 
 ```bash
-# Preview without writing
+# COMMON CASE — self-hosted runners on LAN; auto mode handles your /24
+./whitelist-cicd.sh --custom "192.168.2.0/24,203.0.113.42" --dry-run
+
+# Apply (sudo on NAS)
+sudo ./whitelist-cicd.sh --custom "192.168.2.0/24,203.0.113.42" --apply
+
+# WITH GitHub hosted-runner ranges (publicly-reachable NAS only — rare)
+# Auto mode emits ~20 netmask lines instead of 500k individual IPs
 ./whitelist-cicd.sh --include github,gitlab --custom 192.168.2.0/24 --dry-run
 
-# Apply (writes /usr/builtin/etc/ipblock/defender.safe; requires sudo)
-sudo ./whitelist-cicd.sh --include github,gitlab --custom 192.168.2.0/24 --apply
+# Test netmask-matching support on YOUR ADM first
+./whitelist-cicd.sh --custom 10.99.99.0/24 --cidr-mode netmask --apply
+# Then SSH from inside 10.99.99.0/24 and confirm the previously-banned
+# IP can now connect cleanly. If it can't, your ADM doesn't honor
+# netmask matching; fall back to --cidr-mode expand (or just don't
+# whitelist hosted-runner ranges).
 ```
 
 ### Option B — Loosen the policy
