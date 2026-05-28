@@ -12,12 +12,22 @@
 #   ./whitelist-cicd.sh [--include LIST] [--custom CIDR,...] [--dry-run | --apply]
 #                       [--out PATH] [--max-expand N]
 #
-#   --include LIST       Comma-separated providers to include. Default:
-#                        all known. Choices:
-#                          github     (api.github.com/meta — .actions + .git + .api + .hooks)
+#   --include LIST       Comma-separated providers to whitelist. EMPTY by
+#                        default — for self-hosted-runner setups (the
+#                        common artifact-nas use case) the NAS is on a
+#                        private LAN and only sees connections from the
+#                        runners themselves. GitHub-hosted runner IPs are
+#                        irrelevant unless your NAS is publicly reachable
+#                        AND you use GitHub-hosted runners. Choices:
+#                          github     (api.github.com/meta — Azure-backed
+#                                     ranges; expands to ~500k IPs even
+#                                     with --max-expand 24)
 #                          gitlab     (documented gitlab.com runner ranges)
-#   --custom CIDR,...    Additional CIDRs / IPs to whitelist (e.g. your
-#                        self-hosted runner LAN: 192.168.2.0/24).
+#   --custom CIDR,...    THE THING YOU PROBABLY WANT: CIDRs/IPs to
+#                        whitelist (e.g. self-hosted runner LAN:
+#                        192.168.2.0/24, public IP: 88.159.241.238).
+#                        For a typical CI setup this is the only flag
+#                        you need.
 #   --dry-run            (default) Print proposed defender.safe lines to
 #                        stdout; do NOT write.
 #   --apply              Append non-duplicate lines to
@@ -33,8 +43,11 @@
 #                        based CIDR support is version-dependent (TODO).
 #
 # Examples:
-#   # Preview what would be added
-#   ./whitelist-cicd.sh --include github,gitlab --custom 192.168.2.0/24 --dry-run
+#   # COMMON CASE — whitelist your self-hosted runner LAN + public IP
+#   ./whitelist-cicd.sh --custom "192.168.2.0/24,88.159.241.238" --dry-run
+#
+#   # Rare: also whitelist GitHub Actions hosted-runner ranges (large)
+#   ./whitelist-cicd.sh --include github,gitlab --max-expand 20 --dry-run
 #
 #   # Run locally on the NAS, apply changes
 #   ssh -p 2324 admin@nas 'sudo sh -s' < whitelist-cicd.sh --apply --include github
@@ -47,7 +60,13 @@
 
 set -eu
 
-INCLUDE="github,gitlab"
+# Default OFF for --include: most users only need --custom for their
+# self-hosted runner LAN. Hosted-runner whitelisting (GitHub Actions
+# IPs) only matters when the NAS is publicly reachable AND CI runs on
+# GitHub-hosted runners — uncommon. Without this default, the script
+# would emit ~500k IPs from GitHub's published ranges (Azure-backed),
+# bloating defender.safe for no benefit.
+INCLUDE=""
 CUSTOM=""
 MODE="dry-run"
 OUT="/usr/builtin/etc/ipblock/defender.safe"
