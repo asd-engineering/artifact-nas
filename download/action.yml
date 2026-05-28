@@ -202,8 +202,13 @@ runs:
           [ -z "${line}" ] && continue
           for m in ${line}; do
             # ~ expansion — bash doesn't expand it inside quoted strings.
+            # The prefix-removal pattern MUST be quoted ("~/") to suppress
+            # the parameter-expansion's tilde-expansion: ${m#~/} would
+            # expand the pattern to ${HOME}/ before matching, so the
+            # literal "~/.bun" never matches and nothing is stripped —
+            # leaving m="${HOME}/~/.bun" with a literal tilde dir.
             case "${m}" in
-              "~/"*) m="${HOME}/${m#~/}" ;;
+              "~/"*) m="${HOME}/${m#"~/"}" ;;
               "~")   m="${HOME}" ;;
             esac
             ITEMS+=("${m}")
@@ -344,6 +349,37 @@ runs:
         # not an error, just means a prior run hasn't populated this key.
         # For non-cache modes, missing source IS an error (the upload
         # should have run before us in the same workflow).
+        # --- legacy fallback for single-target callers ----------------
+        # If per-item missed for the only target AND the remote IS
+        # populated (REMOTE_LISTING non-empty), the caller used a name
+        # that doesn't match upload's basename — e.g. download
+        # `path: dist/` paired with upload `path: dist/asd-linux-x64.tar.gz`
+        # (file). Upload's file-branch flattens: remote has
+        # `<SRC_DIR>/asd-linux-x64.tar.gz`, no `dist/` entry. v1.4.1's
+        # unconditional `rclone copy SRC_DIR DEST_PATH` handled this
+        # transparently; the per-item logic in v1.4.2/v1.4.3 doesn't.
+        # release.yml has ~14 such call sites (path: dist/, path: scripts/,
+        # path: metadata/, ...) — they break on the first nas-only path.
+        # Fall through to the legacy `rclone copy SRC_DIR ITEM` semantic
+        # to restore that compatibility. Multi-line callers don't hit
+        # this path (the ANY_HIT=0 with multi-line genuinely means
+        # nothing matched, which is the cache-miss / error case).
+        if [ "${ANY_HIT}" -eq 0 ] && [ "${#ITEMS[@]}" -eq 1 ] && [ -n "${REMOTE_LISTING}" ]; then
+          single="${ITEMS[0]}"
+          mkdir -p "${single}"
+          # Snapshot BEFORE so we can detect actual new files (avoids
+          # the v1.4.3 false-positive where ls -A always returned
+          # non-empty because the dest dir pre-existed).
+          BEFORE_COUNT=$(find "${single}" -mindepth 1 2>/dev/null | wc -l)
+          if rclone_retry copy "${REMOTE}:${SRC_DIR}" "${single}" "${RC_FLAGS[@]}"; then
+            AFTER_COUNT=$(find "${single}" -mindepth 1 2>/dev/null | wc -l)
+            if [ "${AFTER_COUNT}" -gt "${BEFORE_COUNT}" ]; then
+              ANY_HIT=1
+              echo "Single-target restore: ${single} (gained $((AFTER_COUNT - BEFORE_COUNT)) entries)"
+            fi
+          fi
+        fi
+
         if [ "${MODE}" = "cache" ]; then
           if [ "${ANY_HIT}" -eq 1 ]; then
             echo "✅ NAS cache HIT: ${ART_NAME} -> ${ITEMS[*]}"

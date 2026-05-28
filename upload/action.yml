@@ -237,12 +237,27 @@ runs:
         echo "NAS destination: ${REMOTE}:${DEST_DIR}"
 
         # --- collect sources (glob-expanded, existing only) ---
+        # Tilde expansion: bash doesn't expand `~` inside double-quoted
+        # parameters, and the for-loop's word-splitting doesn't trigger
+        # it either. Without explicit substitution, `path: ~/.bun`
+        # produces `[ -e "~/.bun" ]` = false (literal tilde dir doesn't
+        # exist) and the item is silently dropped from ITEMS. This
+        # regressed every workspace cache compared to actions/cache@v4
+        # which tilde-expanded natively.
+        #
+        # The prefix-removal pattern MUST be quoted ("~/") to suppress
+        # the parameter-expansion's tilde-expansion of the pattern
+        # itself (see download/action.yml for the same fix).
         shopt -s nullglob
         declare -a ITEMS=()
         while IFS= read -r line; do
           line="${line//$'\r'/}"
           [ -z "${line}" ] && continue
           for m in ${line}; do
+            case "${m}" in
+              "~/"*) m="${HOME}/${m#"~/"}" ;;
+              "~")   m="${HOME}" ;;
+            esac
             [ -e "${m}" ] && ITEMS+=("${m}")
           done
         done <<< "${ART_PATH}"
@@ -413,11 +428,20 @@ runs:
         DEST_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
         echo "NAS destination (nas-first): ${REMOTE}:${DEST_DIR}"
 
+        # See main nas step (lines 240-260) for the tilde-expansion
+        # rationale. Same code path duplicated here for the nas-first
+        # variant; keep them in sync.
         shopt -s nullglob
         declare -a ITEMS=()
         while IFS= read -r line; do
           line="${line//$'\r'/}"; [ -z "${line}" ] && continue
-          for m in ${line}; do [ -e "${m}" ] && ITEMS+=("${m}"); done
+          for m in ${line}; do
+            case "${m}" in
+              "~/"*) m="${HOME}/${m#"~/"}" ;;
+              "~")   m="${HOME}" ;;
+            esac
+            [ -e "${m}" ] && ITEMS+=("${m}")
+          done
         done <<< "${ART_PATH}"
 
         if [ "${#ITEMS[@]}" -eq 0 ]; then
