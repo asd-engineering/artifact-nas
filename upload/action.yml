@@ -314,6 +314,20 @@ runs:
             else
               exit_code=$?
             fi
+            # "connection refused" is a HARD block — the NAS sshd is down or
+            # this runner's IP is fail2ban-banned. Retrying 5x just hammers
+            # the appliance and SUSTAINS the ban (each attempt is another
+            # failed connection fail2ban counts). Fail FAST so the caller
+            # fails over immediately (gh-fallback on upload, cache-miss /
+            # GitHub-first on download) instead of burning ~60s and digging
+            # the ban deeper. Distinct from the transient SFTP-init races
+            # below (sshd MaxStartups queue, mid-handshake EOF), which a
+            # short backoff genuinely recovers.
+            if grep -qE "connection refused" "$errlog"; then
+              echo "::warning::NAS connection refused — host down or runner IP fail2ban-banned; not retrying, failing over now"
+              rm -f "$errlog"
+              return "$exit_code"
+            fi
             if grep -qE "NewFs:|couldn't initialise SFTP|unexpected EOF|connection reset|version packet from server" "$errlog"; then
               if [ "$attempt" -lt "$max_attempts" ]; then
                 echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
@@ -464,6 +478,20 @@ runs:
           while [ "$attempt" -le "$max_attempts" ]; do
             # See main rclone_retry above for why the else-branch is required.
             if rclone "$@" 2> >(tee "$errlog" >&2); then rm -f "$errlog"; return 0; else exit_code=$?; fi
+            # "connection refused" is a HARD block — the NAS sshd is down or
+            # this runner's IP is fail2ban-banned. Retrying 5x just hammers
+            # the appliance and SUSTAINS the ban (each attempt is another
+            # failed connection fail2ban counts). Fail FAST so the caller
+            # fails over immediately (gh-fallback on upload, cache-miss /
+            # GitHub-first on download) instead of burning ~60s and digging
+            # the ban deeper. Distinct from the transient SFTP-init races
+            # below (sshd MaxStartups queue, mid-handshake EOF), which a
+            # short backoff genuinely recovers.
+            if grep -qE "connection refused" "$errlog"; then
+              echo "::warning::NAS connection refused — host down or runner IP fail2ban-banned; not retrying, failing over now"
+              rm -f "$errlog"
+              return "$exit_code"
+            fi
             if grep -qE "NewFs:|couldn't initialise SFTP|unexpected EOF|connection reset|version packet from server" "$errlog"; then
               if [ "$attempt" -lt "$max_attempts" ]; then
                 echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
