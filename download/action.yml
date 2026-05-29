@@ -391,17 +391,37 @@ runs:
         if [ "${ANY_HIT}" -eq 0 ] && [ "${#ITEMS[@]}" -eq 1 ]; then
           single="${ITEMS[0]}"
           mkdir -p "${single}"
-          # Snapshot BEFORE so we can detect actual new files (avoids
-          # the v1.4.3 false-positive where ls -A always returned
-          # non-empty because the dest dir pre-existed).
-          BEFORE_COUNT=$(find "${single}" -mindepth 1 2>/dev/null | wc -l)
-          if rclone_retry copy "${REMOTE}:${SRC_DIR}" "${single}" "${RC_FLAGS[@]}"; then
+          # v1.4.6 — retry on a ZERO-GAIN copy. The Asustor sftpmand
+          # readdir is intermittently flaky: `rclone copy` of a populated
+          # SRC_DIR can return exit 0 having transferred NOTHING because
+          # the server's directory listing came back empty on that call.
+          # `rclone_retry` does NOT catch this (the copy "succeeds", exit 0),
+          # so a single transient empty-readdir was a hard download failure
+          # (observed 2026-05-29: install-scripts gained 0 files 35s after a
+          # confirmed-good upload, while a sibling download succeeded seconds
+          # earlier). Retry the copy when it gains nothing from a source we
+          # expect to be populated. `cache` mode tolerates a genuine miss
+          # (no retry storm — break on first zero-gain). Snapshot BEFORE so
+          # we count only actually-new files (avoids the v1.4.3 pre-existing-
+          # dir false positive).
+          st_attempt=1; st_max=4; st_backoff=2
+          while [ "${st_attempt}" -le "${st_max}" ]; do
+            BEFORE_COUNT=$(find "${single}" -mindepth 1 2>/dev/null | wc -l)
+            rclone_retry copy "${REMOTE}:${SRC_DIR}" "${single}" "${RC_FLAGS[@]}" || true
             AFTER_COUNT=$(find "${single}" -mindepth 1 2>/dev/null | wc -l)
             if [ "${AFTER_COUNT}" -gt "${BEFORE_COUNT}" ]; then
               ANY_HIT=1
-              echo "Single-target restore: ${single} (gained $((AFTER_COUNT - BEFORE_COUNT)) entries)"
+              echo "Single-target restore: ${single} (gained $((AFTER_COUNT - BEFORE_COUNT)) entries, attempt ${st_attempt})"
+              break
             fi
-          fi
+            [ "${MODE}" = "cache" ] && break  # genuine cache miss — don't retry
+            if [ "${st_attempt}" -lt "${st_max}" ]; then
+              echo "::warning::single-target copy gained 0 files from ${SRC_DIR} (sftpmand readdir glitch?) — retry ${st_attempt}/${st_max} in ${st_backoff}s"
+              sleep "${st_backoff}"
+              st_backoff=$((st_backoff * 2))
+            fi
+            st_attempt=$((st_attempt + 1))
+          done
         fi
 
         if [ "${MODE}" = "cache" ]; then
