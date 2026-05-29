@@ -375,7 +375,20 @@ runs:
         # to restore that compatibility. Multi-line callers don't hit
         # this path (the ANY_HIT=0 with multi-line genuinely means
         # nothing matched, which is the cache-miss / error case).
-        if [ "${ANY_HIT}" -eq 0 ] && [ "${#ITEMS[@]}" -eq 1 ] && [ -n "${REMOTE_LISTING}" ]; then
+        #
+        # v1.4.5: do NOT gate this on `[ -n "${REMOTE_LISTING}" ]`. The
+        # `lsf` used to populate REMOTE_LISTING is wrapped in
+        # `2>/dev/null || true`, so it returns EMPTY both on a genuine
+        # empty dir AND on any lsf error (e.g. the Asustor sftpmand server
+        # returned no entries / errored on readdir even though the file is
+        # demonstrably on disk — observed 2026-05-29: upload landed a 77MB
+        # zip, the download's lsf came back empty in 0.2s, the fallback was
+        # skipped, "produced no files"). Gating the copy on lsf turned a
+        # flaky LIST into a hard download failure. A single-target caller
+        # (`path: dist/`) just wants "dump SRC_DIR here" — so attempt the
+        # direct copy unconditionally and judge success by whether files
+        # actually arrived (BEFORE/AFTER count), which is the real signal.
+        if [ "${ANY_HIT}" -eq 0 ] && [ "${#ITEMS[@]}" -eq 1 ]; then
           single="${ITEMS[0]}"
           mkdir -p "${single}"
           # Snapshot BEFORE so we can detect actual new files (avoids
