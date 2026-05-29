@@ -1,0 +1,64 @@
+name: NAS readdir probe
+
+# Diagnostic for the intermittent "rclone lsf/copy of a populated dir returns
+# EMPTY" failures against the Asustor sftpmand (internal-sftp). Uploads a
+# probe dir with a few files, then loops rclone lsf N times capturing -vv on
+# every empty result, so we can see what the SFTP server actually does on a
+# bad readdir (error code vs genuinely-empty listing). Reports the empty-rate.
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "How many lsf attempts"
+        required: false
+        default: "40"
+
+concurrency:
+  group: nas-readdir-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: [self-hosted, Linux]
+    env:
+      RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
+      NAS_DEST: ${{ secrets.NAS_DEST }}
+      ITERS: ${{ github.event.inputs.iterations || '40' }}
+    steps:
+      - name: Probe sftpmand readdir
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! command -v rclone >/dev/null 2>&1; then
+            curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rc.zip
+            (cd /tmp && unzip -qo rc.zip && cp rclone-*-linux-amd64/rclone /tmp/rclone && chmod +x /tmp/rclone)
+            export PATH="/tmp:$PATH"
+          fi
+          CONF="$(mktemp)"; printf '%s' "${RCLONE_CONF_B64}" | base64 -d > "$CONF"
+          export RCLONE_CONFIG="$CONF"
+          REMOTE="$(awk -F'[][]' '/^\[/{print $2; exit}' "$CONF")"
+          FLAGS="--sftp-concurrency 1 --sftp-disable-concurrent-reads --timeout 30s --contimeout 10s"
+          DIR="${NAS_DEST%/}/readdir-probe"
+
+          echo "=== seed a probe dir with 5 files ==="
+          tmp="$(mktemp -d)"; for i in 1 2 3 4 5; do echo "probe-$i" > "$tmp/file-$i.txt"; done
+          rclone copy "$tmp" "${REMOTE}:${DIR}" $FLAGS
+          echo "seeded ${REMOTE}:${DIR}"
+
+          echo "=== loop ${ITERS}x: lsf, count entries, dump -vv on empty ==="
+          empty=0; ok=0
+          for i in $(seq 1 "${ITERS}"); do
+            out="$(rclone lsf "${REMOTE}:${DIR}/" $FLAGS 2>/dev/null)"
+            n="$(printf '%s' "$out" | grep -c . || true)"
+            if [ "$n" -eq 0 ]; then
+              empty=$((empty+1))
+              echo "--- attempt $i: EMPTY (expected 5) — verbose trace: ---"
+              rclone lsf "${REMOTE}:${DIR}/" $FLAGS -vv 2>&1 | tail -25 || true
+            else
+              ok=$((ok+1))
+            fi
+          done
+          echo "=== RESULT: ok=${ok} empty=${empty} of ${ITERS} ==="
+          rclone purge "${REMOTE}:${DIR}" $FLAGS 2>/dev/null || true
+          # Don't fail the job — this is diagnostic.
+          exit 0
