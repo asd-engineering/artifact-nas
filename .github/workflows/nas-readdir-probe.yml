@@ -1,17 +1,26 @@
 name: NAS readdir probe
 
-# Diagnostic for the intermittent "rclone lsf/copy of a populated dir returns
-# EMPTY" failures against the Asustor sftpmand (internal-sftp). Uploads a
-# probe dir with a few files, then loops rclone lsf N times capturing -vv on
-# every empty result, so we can see what the SFTP server actually does on a
-# bad readdir (error code vs genuinely-empty listing). Reports the empty-rate.
+# Diagnostic for the intermittent NAS failures under the release matrix.
+# v2: reproduces CONCURRENT + cross-connection + large-transfer load (the
+# real conditions; sequential isolated lsf was 40/40 fine). Seeds a small
+# dir + a big file, then runs P parallel workers each looping: cross-connection
+# lsf (readdir) + copy of the big file. Counts readdir-empties and copy-fails,
+# dumps rclone -vv on the first few failures so we see error vs timeout vs empty.
 on:
   workflow_dispatch:
     inputs:
-      iterations:
-        description: "How many lsf attempts"
+      parallel:
+        description: "parallel workers"
         required: false
-        default: "40"
+        default: "6"
+      rounds:
+        description: "rounds per worker"
+        required: false
+        default: "8"
+      bigmb:
+        description: "big-file size MB"
+        required: false
+        default: "120"
 
 concurrency:
   group: nas-readdir-probe
@@ -23,9 +32,11 @@ jobs:
     env:
       RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
       NAS_DEST: ${{ secrets.NAS_DEST }}
-      ITERS: ${{ github.event.inputs.iterations || '40' }}
+      PAR: ${{ github.event.inputs.parallel || '6' }}
+      ROUNDS: ${{ github.event.inputs.rounds || '8' }}
+      BIGMB: ${{ github.event.inputs.bigmb || '120' }}
     steps:
-      - name: Probe sftpmand readdir
+      - name: Concurrent NAS probe
         shell: bash
         run: |
           set -uo pipefail
@@ -38,27 +49,52 @@ jobs:
           export RCLONE_CONFIG="$CONF"
           REMOTE="$(awk -F'[][]' '/^\[/{print $2; exit}' "$CONF")"
           FLAGS="--sftp-concurrency 1 --sftp-disable-concurrent-reads --timeout 30s --contimeout 10s"
-          DIR="${NAS_DEST%/}/readdir-probe"
+          BASE="${NAS_DEST%/}/readdir-probe"
 
-          echo "=== seed a probe dir with 5 files ==="
-          tmp="$(mktemp -d)"; for i in 1 2 3 4 5; do echo "probe-$i" > "$tmp/file-$i.txt"; done
-          rclone copy "$tmp" "${REMOTE}:${DIR}" $FLAGS
-          echo "seeded ${REMOTE}:${DIR}"
+          echo "=== seed: 5 small files + 1 big (${BIGMB}MB) ==="
+          tmp="$(mktemp -d)"; mkdir -p "$tmp/small"
+          for i in 1 2 3 4 5; do echo "probe-$i" > "$tmp/small/file-$i.txt"; done
+          head -c $((BIGMB*1024*1024)) /dev/urandom > "$tmp/big.bin"
+          rclone copy "$tmp/small" "${REMOTE}:${BASE}/small" $FLAGS
+          rclone copyto "$tmp/big.bin" "${REMOTE}:${BASE}/big.bin" $FLAGS
+          echo "seeded."
 
-          echo "=== loop ${ITERS}x: lsf, count entries, dump -vv on empty ==="
-          empty=0; ok=0
-          for i in $(seq 1 "${ITERS}"); do
-            out="$(rclone lsf "${REMOTE}:${DIR}/" $FLAGS 2>/dev/null)"
-            n="$(printf '%s' "$out" | grep -c . || true)"
-            if [ "$n" -eq 0 ]; then
-              empty=$((empty+1))
-              echo "--- attempt $i: EMPTY (expected 5) — verbose trace: ---"
-              rclone lsf "${REMOTE}:${DIR}/" $FLAGS -vv 2>&1 | tail -25 || true
-            else
-              ok=$((ok+1))
-            fi
+          RES="$(mktemp -d)"
+          worker() {
+            local w="$1" empty=0 copyfail=0 r
+            for r in $(seq 1 "${ROUNDS}"); do
+              # cross-connection readdir
+              n="$(rclone lsf "${REMOTE}:${BASE}/small/" $FLAGS 2>/dev/null | grep -c . || true)"
+              if [ "$n" -eq 0 ]; then
+                empty=$((empty+1))
+                { echo "### worker $w round $r READDIR EMPTY"; rclone lsf "${REMOTE}:${BASE}/small/" $FLAGS -vv 2>&1 | tail -12; } >> "$RES/trace.$w" 2>&1
+              fi
+              # large transfer under load
+              d="$(mktemp -d)"
+              if ! rclone copyto "${REMOTE}:${BASE}/big.bin" "$d/big.bin" $FLAGS >/dev/null 2>"$RES/cperr.$w.$r"; then
+                copyfail=$((copyfail+1))
+                { echo "### worker $w round $r COPY FAIL"; tail -12 "$RES/cperr.$w.$r"; } >> "$RES/trace.$w" 2>&1
+              elif [ ! -s "$d/big.bin" ]; then
+                copyfail=$((copyfail+1))
+                echo "### worker $w round $r COPY GAINED 0 (empty result)" >> "$RES/trace.$w"
+              fi
+              rm -rf "$d"
+            done
+            echo "$empty $copyfail" > "$RES/sum.$w"
+          }
+
+          echo "=== launch ${PAR} parallel workers x ${ROUNDS} rounds ==="
+          for w in $(seq 1 "${PAR}"); do worker "$w" & done
+          wait
+
+          te=0; tc=0
+          for w in $(seq 1 "${PAR}"); do
+            read e c < "$RES/sum.$w" 2>/dev/null || { e=0; c=0; }
+            te=$((te+e)); tc=$((tc+c))
           done
-          echo "=== RESULT: ok=${ok} empty=${empty} of ${ITERS} ==="
-          rclone purge "${REMOTE}:${DIR}" $FLAGS 2>/dev/null || true
-          # Don't fail the job — this is diagnostic.
+          total=$((PAR*ROUNDS))
+          echo "=== RESULT: readdir-empty=${te}/${total}  copy-fail=${tc}/${total} (parallel=${PAR}) ==="
+          echo "=== failure traces ==="
+          cat "$RES"/trace.* 2>/dev/null | head -120 || echo "(no failures captured)"
+          rclone purge "${REMOTE}:${BASE}" $FLAGS 2>/dev/null || true
           exit 0
