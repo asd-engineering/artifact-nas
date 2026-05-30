@@ -182,14 +182,16 @@ runs:
 
         # --- source ---
         # Standard (fallback/nas-only): mirror upload's per-run layout
-        #   <dest>/<owner/repo>/<run_id>-<attempt>/<name>/
+        #   <dest>/<owner/repo>/<run_id>/<name>/  (RUN_ID only — see upload
+        #   action: attempt-scoping broke `--failed` re-runs since the
+        #   succeeded producer doesn't re-run/re-upload at the new attempt)
         # Cache mode: stable cross-run path the upload-side cache mode
         # wrote to:
         #   <dest>/cache/<name>/
         if [ "${MODE}" = "cache" ]; then
           SRC_DIR="${NAS_DEST%/}/cache/${ART_NAME}"
         else
-          SRC_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
+          SRC_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${ART_NAME}"
         fi
         echo "NAS source: ${REMOTE}:${SRC_DIR}"
 
