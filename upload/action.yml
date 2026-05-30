@@ -222,7 +222,15 @@ runs:
         # --- destination ---
         # Standard (fallback/always/nas-only/nas-first): per-run path so
         # different CI runs don't clobber each other —
-        #   <dest>/<owner/repo>/<run_id>-<attempt>/<artifact>/
+        #   <dest>/<owner/repo>/<run_id>/<artifact>/
+        # NOTE: keyed on GITHUB_RUN_ID only (NOT run_id-run_attempt). A
+        # `--failed` re-run bumps GITHUB_RUN_ATTEMPT for the re-run jobs but
+        # NOT for the already-succeeded producer (build) job — so an
+        # attempt-scoped path made the consumer look at <run>-2/ while the
+        # artifact sat at <run>-1/ → "directory not found". RUN_ID is stable
+        # across attempts, so a re-run's consumer reads the original
+        # producer's upload. Same-run re-uploads overwrite the same path
+        # (idempotent); different runs have different RUN_IDs (no clobber).
         # Cache mode: cross-run stable path so a later run's restore can
         # find what an earlier run wrote —
         #   <dest>/cache/<name>/
@@ -232,7 +240,7 @@ runs:
         if [ "${MODE}" = "cache" ]; then
           DEST_DIR="${NAS_DEST%/}/cache/${ART_NAME}"
         else
-          DEST_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
+          DEST_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${ART_NAME}"
         fi
         echo "NAS destination: ${REMOTE}:${DEST_DIR}"
 
@@ -439,7 +447,7 @@ runs:
         fi
         trap '[ -n "${CLEANUP_CONF}" ] && rm -f "${CLEANUP_CONF}"' EXIT
 
-        DEST_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
+        DEST_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${ART_NAME}"
         echo "NAS destination (nas-first): ${REMOTE}:${DEST_DIR}"
 
         # See main nas step (lines 240-260) for the tilde-expansion
