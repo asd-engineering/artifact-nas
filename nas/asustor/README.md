@@ -45,7 +45,7 @@ Each line is `<ip>;<netmask>;<flag>`. Example:
 
 ```
 198.51.100.7;0.0.0.0;0
-192.168.2.99;0.0.0.0;0
+192.168.1.99;0.0.0.0;0
 ```
 
 - `<ip>` — IPv4 dotted-quad
@@ -74,14 +74,14 @@ runner IP ranges via `--include`. Three CIDR-emission modes:
 
 ```bash
 # COMMON CASE — self-hosted runners on LAN; auto mode handles your /24
-./whitelist-cicd.sh --custom "192.168.2.0/24,203.0.113.42" --dry-run
+./whitelist-cicd.sh --custom "192.168.1.0/24,203.0.113.42" --dry-run
 
 # Apply (sudo on NAS)
-sudo ./whitelist-cicd.sh --custom "192.168.2.0/24,203.0.113.42" --apply
+sudo ./whitelist-cicd.sh --custom "192.168.1.0/24,203.0.113.42" --apply
 
 # WITH GitHub hosted-runner ranges (publicly-reachable NAS only — rare)
 # Auto mode emits ~20 netmask lines instead of 500k individual IPs
-./whitelist-cicd.sh --include github,gitlab --custom 192.168.2.0/24 --dry-run
+./whitelist-cicd.sh --include github,gitlab --custom 192.168.1.0/24 --dry-run
 
 # Test netmask-matching support on YOUR ADM first
 ./whitelist-cicd.sh --custom 10.99.99.0/24 --cidr-mode netmask --apply
