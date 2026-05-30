@@ -136,3 +136,82 @@ After applying the whitelist:
    `kex_exchange_identification: read: Connection reset by peer`.
 3. Check `/usr/builtin/etc/ipblock/abuseip.deny` (the deny list) to see
    it does NOT contain your runner's IP.
+
+---
+
+# The SFTP service is `sftpmand` on port 4589 — NOT the main sshd
+
+The single most confusing thing about this appliance: **CI's SFTP and your
+interactive SSH login are two different daemons.**
+
+| Daemon | Port | Binary | Config | Serves |
+|---|---|---|---|---|
+| main `sshd` | 2324 (custom) | `/usr/sbin/sshd` | `/usr/etc/ssh/sshd_config` (`Subsystem sftp /bin/false`) | your interactive admin login |
+| **`sftpmand`** | **4589** | `/usr/builtin/sbin/sftpmand` | `/usr/builtin/etc/sshd_config_sftp` (`Port 4589`, `AllowGroups users`, `Subsystem sftp internal-sftp`, `ForceCommand internal-sftp`) | **the `artifact-nas` / `asd-cicd` SFTP** |
+
+So **"I can still SSH in"** (2324) tells you nothing about whether CI's 4589 is
+up. Diagnose 4589 specifically:
+
+```sh
+ps -ef | grep '[s]ftpmand'        # is the daemon alive?
+ss -tlnp | grep :4589             # is it listening?
+```
+
+`sftpmand` is gated on `confutil -get /usr/builtin/etc/sftp.conf "" enable` ==
+`Yes` and started by `/usr/builtin/etc/init.d/S79sftpmand`. Connections fork
+`sshd-session`, which is subject to the two binary patches below.
+
+## Two binary patches `sshd-session` needs (`nas/asustor/`)
+
+ADM ships `/usr/bin/sshd-session` with two independent bugs that both surface
+as "port 4589 unreachable" — **both** must be applied:
+
+1. **`patch-sshd-session.py`** — ADM hardcodes `DefaultAllowGroups =
+   "administrators"`; CI users (group `users`) are rejected as NOUSER. Patches
+   the embedded string to `"users"`.
+2. **`patch-seccomp.py`** — the preauth privsep seccomp filter's default action
+   is `KILL_THREAD`; something in the monitor calls `unlink` (syscall 87), so
+   sessions crash with `SIGSYS` (`dmesg`: `sig=31 … syscall=87`), escalate
+   `PerSourcePenalties`, and eventually the service supervisor drops the 4589
+   listener. Flips the BPF default to `ALLOW`. Idempotent; refuses to write if
+   the binary doesn't match (offset drift across firmware builds → re-find).
+
+## Recovery + boot-persistence (the durable fix)
+
+ADM **regenerates `/usr/etc` and resets `/usr/bin/sshd-session` on reboot /
+firmware update**, which un-patches the binary and lets `sftpmand` die without
+auto-restarting — the recurring "4589 was working, now it's refused" cycle.
+
+Recovery is a single idempotent script (`asd-nas-recover.sh`): re-apply both
+patches → restart `sftpmand` → `HUP` the main sshd (clears penalties) → verify
+4589. Persist the script + the seccomp patch on the **data volume** (`/usr/local`
+is on the RAID and survives firmware resets, unlike `/usr/etc`) and wire it to
+`@reboot`:
+
+```sh
+# persistent home (survives firmware resets):
+/usr/local/sbin/patch-sshd-session.py
+/usr/local/sbin/patch-seccomp.py
+/usr/local/sbin/asd-nas-recover.sh
+
+# root crontab (/usr/builtin/etc/crontabs/root): run full recovery on boot
+@reboot sleep 45 && /bin/sh /usr/local/sbin/asd-nas-recover.sh >> /var/log/asd-nas-recover.log 2>&1
+
+# manual run any time 4589 is down:
+sudo sh /usr/local/sbin/asd-nas-recover.sh
+```
+
+`sleep 45` lets the stock `S79sftpmand` + filesystem come up first, then the
+recovery re-patches and restarts cleanly on top.
+
+## Intermittent empty `readdir` under load
+
+Even when healthy, `sftpmand` (`internal-sftp`) can occasionally return an
+**empty directory listing for a populated dir** when many CI connections hit it
+at once (uploads + cross-runner reads during a full release matrix). It's rare,
+load-dependent, and not reproducible in isolation (a sequential and a 6-way
+concurrent probe were both 0-failure). The `artifact-nas` action mitigates it
+(v1.4.6 zero-gain retry) and v1.4.7's `RUN_ID`-only path makes
+`gh run rerun <id> --failed` a reliable recovery — see the action README's
+"Reliability hardening" section. Loosening `MaxStartups` in `sshd_config_sftp`
+may help but is unverified on this firmware.
