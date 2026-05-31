@@ -173,20 +173,39 @@ WD
 chmod 0755 "$WATCHDOG"
 ok "installed $WATCHDOG"
 
-# register watchdog in cron (every minute) + @reboot, idempotently
-CRON=/usr/builtin/etc/crontab
-[ -f "$CRON" ] || CRON=/etc/crontab
-if [ -f "$CRON" ]; then
-  if ! grep -q "$WATCHDOG" "$CRON" 2>/dev/null; then
-    printf '* * * * * root %s\n' "$WATCHDOG" >> "$CRON"
-    ok "cron: per-minute watchdog added to $CRON"
-    # reload crond if present
-    killall -HUP crond 2>/dev/null || /usr/builtin/etc/init.d/S*crond restart >/dev/null 2>&1 || true
+# register watchdog every minute, idempotently. Asustor runs BUSYBOX crond
+# reading /var/spool/cron/crontabs/<user> (-> /usr/builtin/etc/crontabs,
+# persistent on /volume0). That format has NO user field: "* * * * * cmd".
+# Prefer the `crontab` command (writes the right spool); fall back to a
+# direct spool append, then to /etc/crontab (user-field) as a last resort.
+if command -v crontab >/dev/null 2>&1; then
+  if crontab -l 2>/dev/null | grep -q "sftp-cicd-watchdog"; then
+    ok "cron: watchdog already registered (crontab -l)"
   else
-    ok "cron: watchdog already registered in $CRON"
+    ( crontab -l 2>/dev/null | grep -v "sftp-cicd-watchdog"
+      printf '* * * * * %s\n' "$WATCHDOG" ) | crontab -
+    ok "cron: per-minute watchdog added (crontab, no user field)"
   fi
+  killall -HUP crond 2>/dev/null || true
+elif [ -d /usr/builtin/etc/crontabs ] || [ -d /var/spool/cron/crontabs ]; then
+  CT=/usr/builtin/etc/crontabs/root
+  [ -d /usr/builtin/etc/crontabs ] || CT=/var/spool/cron/crontabs/root
+  touch "$CT" 2>/dev/null
+  if grep -q "sftp-cicd-watchdog" "$CT" 2>/dev/null; then
+    ok "cron: watchdog already registered in $CT"
+  else
+    printf '* * * * * %s\n' "$WATCHDOG" >> "$CT"
+    chmod 600 "$CT" 2>/dev/null
+    ok "cron: per-minute watchdog added to $CT (no user field)"
+  fi
+  killall -HUP crond 2>/dev/null || true
+elif [ -f /etc/crontab ]; then
+  grep -q "sftp-cicd-watchdog" /etc/crontab 2>/dev/null || \
+    printf '* * * * * root %s\n' "$WATCHDOG" >> /etc/crontab
+  ok "cron: watchdog added to /etc/crontab (user-field format)"
+  killall -HUP crond 2>/dev/null || true
 else
-  warn "no crontab found — watchdog installed but not scheduled; add manually: * * * * * $WATCHDOG"
+  warn "no crontab mechanism found — watchdog installed but not scheduled; add manually: * * * * * $WATCHDOG"
 fi
 
 # 5) restart the SFTP service and verify
