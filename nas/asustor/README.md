@@ -411,3 +411,75 @@ in the binary itself:
 
 Patch BOTH, leave the rest alone. Configuration tweaks on the periphery
 mask the symptoms transiently and rot back on the next ADM update.
+
+---
+
+# THIRD layer (post-patch): the master dies under a concurrent burst — `fix-sftp-cicd.sh`
+
+The two binary patches fix per-connection **crashes**. They do not make
+the SFTP service survive **concurrency**. Re-verified on AS6706T / ADM
+4.2.5 / OpenSSH_9.8p1 (2026-05-31), with both patches already applied
+(`sshd-session.asustor-original` + `sshd-session.before-seccomp-patch`
+backups present):
+
+- A single handshake to `localhost:4589` succeeds cleanly.
+- A burst of 50 concurrent connections produced **zero new `sig=31`
+  audits** (the seccomp patch holds) — but also dropped ~⅓ of
+  connections (`kex_exchange_identification` / connection-closed), and
+  after a few repeated bursts the **`sftpmand` supervisor and the
+  `sshd_sftp` listener both exited and port 4589 stayed down**. Asustor
+  did **not** auto-restart them.
+
+That is the failure CI actually hits: parallel `rclone` uploads + retry
+storms burst the listener, the master falls over, and every subsequent
+upload gets `connection refused` / `EOF` until someone restarts the
+service by hand. Three stock-config facts drive it:
+
+| Fact | Stock value | Effect under CI burst |
+|---|---|---|
+| `MaxStartups` | unset → `10:30:100` | random-early-drop past 10 pre-auth conns → `EOF` |
+| `PerSourcePenalties` | on (9.8 default) | one busy runner IP gets progressively dropped |
+| ipblock `Login_Attempt`/`Block_Time` | `1` / `0` | **permaban after a single failed auth** (manual clear only) |
+
+This is a different layer from the binary patches, so it gets its own
+script — `fix-sftp-cicd.sh` — which does **only** the concurrency +
+resilience work (it does not re-patch the binary, and deliberately does
+not touch `PrintLastLog`):
+
+1. Raises `MaxStartups 200:30:1000`, `MaxSessions 100`,
+   `PerSourceMaxStartups 100`, and sets `PerSourcePenalties no` — in
+   **both** config copies (runtime + `etc.default`).
+2. Loosens ipblock from permaban to a self-healing window
+   (`Login_Attempt=10`, `Time_Period=300`, `Block_Time=600`).
+3. Installs `/usr/local/sbin/sftp-cicd-watchdog.sh` + a per-minute cron
+   that restarts `sftpmand` whenever port 4589 is down — so even if a
+   burst still knocks it over, it comes back within a minute instead of
+   staying dead.
+4. Restarts the service and verifies the port listens.
+
+```bash
+sudo sh fix-sftp-cicd.sh            # apply (idempotent; writes .cicd-bak backups)
+sudo sh fix-sftp-cicd.sh --check    # diff current vs desired, no changes
+sudo sh fix-sftp-cicd.sh --verify   # patch-state + listener + new-sig=31 report
+```
+
+## Run order (full fix from a fresh / firmware-reset NAS)
+
+```bash
+sudo python3 patch-sshd-session.py   # AllowGroups → users
+sudo python3 patch-seccomp.py        # SIGSYS-on-unlink → ALLOW
+sudo sh     fix-sftp-cicd.sh         # concurrency + ipblock + watchdog + restart
+sudo sh     fix-sftp-cicd.sh --verify
+```
+
+## Honest caveat — this is mitigation, not a stable server
+
+Even with all three layers, the Asustor master is a fragile listener
+fronted by a watchdog: a hard enough burst can still drop it for up to
+a minute before the cron brings it back. If CI needs a genuinely stable
+SFTP endpoint, a plain OpenSSH/SFTP **container** (sane `MaxStartups`,
+no `ipblock` supervisor, no vendor-patched binary) on the NAS host is
+the durable answer; these scripts are the keep-it-working-today path.
+The client-side belt is to keep `rclone` concurrency modest in the
+`artifact-nas` upload/download actions (`--transfers`/`--checkers`) so
+CI never bursts the listener in the first place.
