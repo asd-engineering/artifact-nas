@@ -26,13 +26,26 @@
 #      rapid connections gets progressively dropped ("penalty: ...").
 #   3. ipblock policy Login_Attempt=1 / Time_Period=0 / Block_Time=0 -> ONE
 #      failed auth permabans the source IP (manual clear only).
+#   4. LoginGraceTime 120 -> a connection that stalls anywhere in pre-auth
+#      (real-internet packet loss, a slow/lossy runner link) HOLDS its
+#      pre-auth slot for two full minutes. Under burst those stalled slots
+#      don't recycle, so the MaxStartups budget exhausts and the daemon
+#      starts throttling — empirically observed 2026-06-02 as
+#      `sshd_sftp: exited MaxStartups throttling after 00:02:19, 933
+#      connections dropped` under a sustained concurrent burst. (The daemon
+#      THROTTLES — drops new pre-auth connections — rather than dying; the
+#      watchdog below still covers the rarer hard-death case.) Cutting
+#      LoginGraceTime to 20s recycles a stalled slot 6x faster, which is the
+#      single biggest lever for sustained high-concurrency capacity once
+#      MaxStartups is already maxed.
 #
-# This script raises the concurrency ceiling, disables the per-source penalty
-# escalation, loosens ipblock to a self-healing window, installs a watchdog
-# that brings the daemon back if a burst still knocks it over, and restarts
-# the service. It patches BOTH config copies (runtime + etc.default) because
-# firmware updates and the init script's `cp defaults -> runtime` line restore
-# from etc.default.
+# This script raises the concurrency ceiling, recycles stalled pre-auth slots
+# fast (LoginGraceTime), disables the per-source penalty escalation, loosens
+# ipblock to a self-healing window, applies a few burst-friendly kernel
+# sysctls, installs a watchdog that brings the daemon back if a burst still
+# knocks it over, and restarts the service. It patches BOTH config copies
+# (runtime + etc.default) because firmware updates and the init script's
+# `cp defaults -> runtime` line restore from etc.default.
 # =============================================================================
 
 set -u
@@ -135,6 +148,7 @@ for f in "$RUNTIME" "$DEFAULTS"; do
   set_directive "$f" MaxSessions        "100"
   set_directive "$f" PerSourceMaxStartups "100"
   set_directive "$f" PerSourcePenalties "no"
+  set_directive "$f" LoginGraceTime     "20"
   # NB: deliberately NOT touching PrintLastLog — patch-seccomp.py already
   # covers the unlink/syscall-87 path, and the README documents PrintLastLog
   # as a peripheral tweak that rots back. This script only addresses the
@@ -147,6 +161,29 @@ log "-- ipblock policy (self-healing window instead of permaban) --"
 set_ini_kv "$IPBLOCK" Login_Attempt 10
 set_ini_kv "$IPBLOCK" Time_Period   300
 set_ini_kv "$IPBLOCK" Block_Time    600
+
+# 2b) burst-friendly kernel sysctls. Asustor has no persistent /etc/sysctl.d
+#     that survives firmware, so we apply at runtime here AND have the watchdog
+#     (step 4) re-assert them every minute — cheap and reboot-proof.
+#       tcp_max_syn_backlog 512 -> 2048 : absorb the SYN burst of a [ci all]
+#         fan-out before syncookies kick in (kernel logged "Possible SYN
+#         flooding on port :4589. Sending cookies" under load 2026-06-02).
+#       somaxconn 4096 (already) : listen() accept queue depth — left as-is.
+#       vm.swappiness 60 -> 10 : the box idles with ~850MB in swap (Nextcloud/
+#         OnlyOffice anon pages); swappiness 10 keeps sshd_sftp resident so a
+#         burst doesn't fault pre-auth children back in from disk mid-handshake.
+SYSCTL_KV="net.ipv4.tcp_max_syn_backlog=2048 vm.swappiness=10"
+apply_sysctls() { for kv in $SYSCTL_KV; do sysctl -w "$kv" >/dev/null 2>&1; done; }
+log "-- kernel sysctls (burst) --"
+if [ "$MODE" = check ]; then
+  for kv in $SYSCTL_KV; do
+    key=${kv%%=*}; want=${kv#*=}
+    printf '  %-46s %-22s have: %s\n' "sysctl" "$kv" "$(sysctl -n "$key" 2>/dev/null)"
+  done
+else
+  apply_sysctls
+  for kv in $SYSCTL_KV; do ok "sysctl $kv (now: $(sysctl -n "${kv%%=*}" 2>/dev/null))"; done
+fi
 
 # 3) binary-patch presence check (do NOT auto re-patch — that's the .py scripts' job)
 log "-- binary-patch presence --"
@@ -162,7 +199,9 @@ fi
 log "-- watchdog --"
 cat > "$WATCHDOG" <<WD
 #!/bin/sh
-# Restart Asustor sftpmand if port $PORT is not listening. Installed by fix-sftp-cicd.sh.
+# Restart Asustor sftpmand if port $PORT is not listening, and re-assert the
+# burst sysctls (reboot-proof persistence). Installed by fix-sftp-cicd.sh.
+for kv in $SYSCTL_KV; do sysctl -w "\$kv" >/dev/null 2>&1; done
 if command -v ss >/dev/null 2>&1; then ss -tln 2>/dev/null | grep -q ":$PORT " && exit 0
 else netstat -tln 2>/dev/null | grep -q ":$PORT " && exit 0; fi
 logger -t sftp-watchdog "port $PORT down — restarting sftpmand" 2>/dev/null || true
@@ -213,11 +252,19 @@ log "-- restart sftpmand --"
 "$INIT" stop  >/dev/null 2>&1
 sleep 1
 "$INIT" start >/dev/null 2>&1
-sleep 2
-if port_listening; then
-  ok "port $PORT LISTEN — SFTP service up"
+# Poll for readiness rather than a fixed sleep: this NAS can take >2s to
+# rebind :$PORT after start, and a fixed `sleep 2` produced a FALSE "DOWN"
+# warning while the daemon was in fact coming up fine. Wait on the real
+# signal (port LISTEN), up to 30s.
+up=0; waited=0
+while [ "$waited" -lt 30 ]; do
+  if port_listening; then up=1; break; fi
+  sleep 1; waited=$((waited+1))
+done
+if [ "$up" = 1 ]; then
+  ok "port $PORT LISTEN — SFTP service up (after ${waited}s)"
 else
-  warn "port $PORT still DOWN after restart — check: $INIT start ; tail /var/log/messages"
+  warn "port $PORT still DOWN after ${waited}s — check: $INIT start ; tail /var/log/messages"
 fi
 
 log "== done. Re-run with --verify after a CI run to confirm no new sig=31 and port stays up. =="
