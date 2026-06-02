@@ -270,22 +270,24 @@ runs:
         # EOF` when sshd's queue is exhausted. rclone_retry() below wraps
         # the whole call to handle init-layer failures.
         RC_FLAGS=(
-          --transfers 4 --retries 3 --low-level-retries 3
+          --transfers 2 --retries 3 --low-level-retries 3
           --sftp-concurrency 1 --sftp-disable-concurrent-reads
           --timeout 30s --contimeout 10s
           --stats-one-line
         )
 
         # rclone_retry — wraps an rclone invocation with exponential
-        # backoff specifically for SFTP NewFs failures (server-side queue
         # exhaustion, mid-handshake EOF, sshd restart races). Backoff:
-        # 1s, 3s, 7s, 15s, 31s (cumulative ~57s across 5 attempts) — long
-        # enough for sshd's MaxStartups queue to drain after a CI burst,
-        # short enough not to balloon a permanently-broken build. Only
+        # 1s, 3s, 7s, 15s, 31s, 63s (cumulative ~120s across 7 attempts) —
+        # long enough to span TWO cycles of the NAS-side per-minute watchdog
+        # (sftp-cicd-watchdog.sh restarts the Asustor sftpmand master when it
+        # dies under a CI burst; a 57s budget could expire inside a single
+        # ~60s down-window and fall back to GitHub before the master is back).
+        # Still short enough not to balloon a permanently-broken build. Only
         # retries on init-layer signatures; real errors (auth fail, perm
         # denied) fail immediately.
         rclone_retry() {
-          local max_attempts=5 attempt=1 backoff=1 errlog exit_code
+          local max_attempts=7 attempt=1 backoff=1 errlog exit_code
           errlog="$(mktemp)"
           while [ "$attempt" -le "$max_attempts" ]; do
             # Capture rclone's exit explicitly in the else-branch. Per
@@ -429,13 +431,13 @@ runs:
         fi
 
         RC_FLAGS=(
-          --transfers 4 --retries 3 --low-level-retries 3
+          --transfers 2 --retries 3 --low-level-retries 3
           --sftp-concurrency 1 --sftp-disable-concurrent-reads
           --timeout 30s --contimeout 10s
           --stats-one-line
         )
         rclone_retry() {
-          local max_attempts=5 attempt=1 backoff=1 errlog exit_code
+          local max_attempts=7 attempt=1 backoff=1 errlog exit_code
           errlog="$(mktemp)"
           while [ "$attempt" -le "$max_attempts" ]; do
             # See main rclone_retry above for why the else-branch is required.
