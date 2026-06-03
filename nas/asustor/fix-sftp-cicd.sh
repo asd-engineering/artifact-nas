@@ -235,9 +235,22 @@ for kv in $SYSCTL_KV; do sysctl -w "\$kv" >/dev/null 2>&1; done
 if [ -x "$NFT" ] && ! "$NFT" list chain $FW_TABLE $FW_CHAIN 2>/dev/null | grep "dport $PORT" | grep -q accept; then
   "$NFT" insert rule $FW_TABLE $FW_CHAIN tcp dport $PORT ct state new accept 2>/dev/null && logger -t sftp-watchdog "re-asserted :$PORT geo-bypass" 2>/dev/null || true
 fi
-if command -v ss >/dev/null 2>&1; then ss -tln 2>/dev/null | grep -q ":$PORT " && exit 0
-else netstat -tln 2>/dev/null | grep -q ":$PORT " && exit 0; fi
-logger -t sftp-watchdog "port $PORT down — restarting sftpmand" 2>/dev/null || true
+# heartbeat so we can verify cron actually fires this watchdog
+date +%s > /tmp/sftp-watchdog.heartbeat 2>/dev/null || true
+# HEALTH probe (not just "is the port open"): a healthy sshd_sftp sends the SSH
+# banner immediately on TCP accept. A daemon that is DOWN *or* wedged in
+# MaxStartups throttling accepts the TCP then closes WITHOUT a banner — the old
+# port-listening check missed that throttle-wedge, which once stuck the daemon
+# dropping every connection for 6+ hours. Reading the banner catches both.
+# Two strikes 2s apart so a momentary legit-load blip doesn't cause a flap.
+sftp_healthy() {
+  b=\$(echo | nc -w 4 127.0.0.1 $PORT 2>/dev/null | head -c 8)
+  case "\$b" in SSH-2.0*) return 0 ;; *) return 1 ;; esac
+}
+if sftp_healthy; then exit 0; fi
+sleep 2
+if sftp_healthy; then exit 0; fi
+logger -t sftp-watchdog "port $PORT not serving an SSH banner (down or MaxStartups-wedged) — restarting sftpmand" 2>/dev/null || true
 $INIT stop  >/dev/null 2>&1
 sleep 1
 $INIT start >/dev/null 2>&1
