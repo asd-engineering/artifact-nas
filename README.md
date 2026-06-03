@@ -1,7 +1,7 @@
 # artifact-nas
 
-**Version:** 1.0.0
-**Last Updated:** 2026-05-25
+**Version:** 1.4.7
+**Last Updated:** 2026-05-31
 **Status:** ACTIVE
 
 Two reusable **GitHub composite actions** — `upload` and `download` — that move
@@ -85,7 +85,7 @@ the runner.
 | `always` | GitHub AND NAS, both every time. | Mirror critical artifacts to a self-hosted copy. |
 | `nas-only` | Skip GitHub entirely. | NAS is the canonical store, GitHub quota is precious. |
 | `nas-first` (v1.2.0) | NAS first; if NAS fails, fall back to GitHub. | NAS is preferred (faster on self-hosted runners, doesn't burn quota) but GitHub is the safety net when the NAS is having an off-day. |
-| `cache` (v1.3.0) | NAS-only at a stable cross-run path (`<nas-dest>/cache/<name>/` — no `<owner/repo>/<run>/<attempt>` scoping). Download tolerates cache miss (exits 0). | Cross-run cache of helper binaries / build outputs / anything else you'd give to `actions/cache` but want on a self-hosted NAS instead. Pair with the same `mode: cache` on both upload + download. Encode any "what version" key into the artifact name (e.g. `helpers-linux-<hashFiles>`). |
+| `cache` (v1.3.0) | NAS-only at a stable cross-run path (`<nas-dest>/cache/<name>/` — no `<owner/repo>/<run_id>` per-run scoping). Download tolerates cache miss (exits 0). | Cross-run cache of helper binaries / build outputs / anything else you'd give to `actions/cache` but want on a self-hosted NAS instead. Pair with the same `mode: cache` on both upload + download. Encode any "what version" key into the artifact name (e.g. `helpers-linux-<hashFiles>`). |
 
 ### Cache mode (v1.3.0)
 
@@ -113,6 +113,36 @@ Use cache mode instead of writing a custom rclone wrapper script (e.g. the previ
 ### SFTP hardening (v1.2.0+)
 
 Default `rclone` flags include `--sftp-concurrency 1`, `--sftp-disable-concurrent-reads`, `--timeout 30s`, `--contimeout 10s`. Combined with the new `rclone_retry()` wrapper, the action survives transient `NewFs: ... unexpected EOF` failures from appliance NAS units (Asustor / Synology / QNAP) whose `sshd` has a low `MaxStartups` cap. Retry uses exponential backoff (1s, 3s, 7s, 15s, 31s; ~57 s budget across 5 attempts) and only triggers on init-layer error signatures — real errors (auth failure, permission denied) fail immediately.
+
+### Reliability hardening (v1.4.5 – v1.4.7)
+
+Battle-tested against a real Asustor `sftpmand` (OpenSSH `internal-sftp`) under
+a full cross-OS release matrix. These fixes turn "the NAS had a bad moment" from
+a hard red into a self-healing or trivially-recoverable event:
+
+| Version | Fix | Why |
+|---|---|---|
+| **v1.4.5** | **Fail fast on `connection refused`** — `rclone_retry` no longer burns its 5-attempt budget when the error is `connection refused` (host down / IP firewall-banned). It fails over to the GitHub leg / cache-miss on the *first* refusal. | Retrying a hard block just hammers the appliance and (with `ipblock`/`fail2ban`) **sustains the ban** — CI was re-banning itself. Distinct from the transient `NewFs: unexpected EOF` init races, which still get the full backoff. |
+| **v1.4.5** | **Single-target download no longer gated on `lsf`** — a `path: dist/`-style restore attempts the direct `rclone copy SRC_DIR target` unconditionally and judges success by actual file count, instead of skipping when a pre-flight `lsf` returned empty. | `lsf` is wrapped in `2>/dev/null \|\| true`, so *any* listing error read as "empty" and aborted the download with "produced no files" — even with the file on disk. |
+| **v1.4.6** | **Retry a single-target copy that gains zero files** (4×, 2/4/8 s) when the source should be populated; `cache` mode breaks on the first zero-gain (a genuine miss must not retry-storm). | `rclone copy` returns exit 0 even when the server's `readdir` momentarily returned an empty listing — so `rclone_retry` (which only watches for connection/init errors) never fired, and one bad listing was a hard failure. |
+| **v1.4.7** | **Per-run path keyed on `GITHUB_RUN_ID` only** — `<dest>/<owner/repo>/<run_id>/<name>/` (previously `<run_id>-<run_attempt>/`). | A **`--failed` re-run** bumps `GITHUB_RUN_ATTEMPT` for the re-run jobs but **not** for the already-succeeded *producer* (build) job, so an attempt-scoped path sent the consumer to `<run>-2/` while the artifact sat at `<run>-1/` → `directory not found`, and **re-running failed jobs could never recover**. `RUN_ID` is stable across attempts; a re-run reads the original upload. Same-run re-uploads overwrite idempotently; distinct runs have distinct `RUN_ID`s (no cross-run clobber). |
+
+#### Known limitation: intermittent `readdir`-empty under heavy concurrent load
+
+On a busy appliance (full release matrix uploading + several e2e jobs reading
+across different runners simultaneously) the SFTP server can occasionally return
+an **empty directory listing for a populated directory** without erroring —
+`rclone copy` then "succeeds" having transferred nothing. In isolation the NAS
+is reliable (a sequential and a 6-way-concurrent probe were both 0-failure); the
+window is rare and load-dependent, and we could not reproduce it in a harness.
+
+The action absorbs most of these via the v1.4.6 zero-gain retry. For the rare
+case that survives the in-step retries, the v1.4.7 `RUN_ID`-only path makes the
+recovery trivial: **just re-run the failed job(s)** (`gh run rerun <id> --failed`)
+— the artifact is still at the same `<run_id>/<name>/` path the producer wrote,
+so the re-run reads it cleanly. If your appliance hits this often, prefer
+GitHub-primary modes (`fallback`/`always`) for release-critical artifacts and
+keep the NAS for caches, where a flaky read is a non-fatal cache miss.
 
 **Env fallback (DRY):** every `nas-*` input also reads from an ambient env var
 when the input is omitted — `nas-conf-b64`←`RCLONE_CONF_B64`,
