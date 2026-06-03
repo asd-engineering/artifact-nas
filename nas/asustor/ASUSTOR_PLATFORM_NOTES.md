@@ -66,8 +66,15 @@ Run order on a fresh / firmware-reset NAS:
   (`<ip>;<netmask>;<flag>`, `0.0.0.0` netmask = single host). See
   `whitelist-cicd.sh`.
 - nftables firewall (ADM "Network Defender") lives in
-  `/usr/builtin/etc/defender/` (`global.json` WAN, `lan.json` profiles).
-  Separate from ipblock; was clean/inactive during this triage.
+  `/usr/builtin/etc/defender/` (`global.json` enable flag, `profiles.json`
+  rules, generated `firewall.nft_*`). Separate from ipblock.
+  **CORRECTION (2026-06-03): this firewall is THE main CI root cause, not
+  "inactive".** Its active profile `Migration_ADM Defender` GEO-BLOCKS inbound
+  by source country (`@NA_US drop`, …) — only Europe + TrustedIP is allowed, so
+  US-registered GitHub runners are dropped before reaching `sshd_sftp`. Rules
+  are source-based only (no port scoping). Full writeup + the keep-firewall-on
+  fix (nft `tcp dport 4589 accept` ahead of the geo-drops, watchdog-reasserted)
+  in [`CI-GEO-BLOCK-AND-RELIABILITY.md`](./CI-GEO-BLOCK-AND-RELIABILITY.md).
 
 ## Cron — busybox, NO user field
 - `crond` is busybox (`/usr/sbin/crond → /bin/busybox`). It reads
