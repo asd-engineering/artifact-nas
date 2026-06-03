@@ -58,6 +58,21 @@ WATCHDOG=/usr/local/sbin/sftp-cicd-watchdog.sh
 SECCOMP_BAK=/usr/bin/sshd-session.before-seccomp-patch
 ALLOWGRP_BAK=/usr/bin/sshd-session.asustor-original
 PORT=4589
+# ADM Defender (defenderd / nftables) geo-blocks inbound by source IP: only
+# Europe + a handful of TrustedIP entries are allowed; NA/AS/AF/OC/SA are
+# dropped via per-country ipsets (`@NA_US.ipv4_* drop`, ...) in chain
+# `ip Asustor_Firewall_V4 Filter`, BEFORE traffic reaches sshd_sftp. GitHub CI
+# runners are US-registered Azure -> dropped -> the artifact-nas EOF. This is
+# the REAL CI root cause (confirmed 2026-06-03 by an external geo-tagged load
+# test: 10/10 US runners FAIL with the geo-block, 10/10 PASS with the rule
+# below). nft is NOT in busybox PATH; use the full path. The rule accepts :4589
+# ahead of the geo-drops — safe because SFTP has key/password auth + ipblock +
+# the hardened sshd; geo-blocking stays intact for every OTHER service. defenderd
+# flushes the Filter chain on reload, so the watchdog re-asserts it every minute.
+NFT=/usr/builtin/sbin/nft
+FW_TABLE="ip Asustor_Firewall_V4"
+FW_CHAIN="Filter"
+FW_MATCH="tcp dport $PORT ct state new accept"
 
 MODE=apply
 case "${1:-}" in
@@ -185,6 +200,19 @@ else
   for kv in $SYSCTL_KV; do ok "sysctl $kv (now: $(sysctl -n "${kv%%=*}" 2>/dev/null))"; done
 fi
 
+# 2c) firewall: accept :PORT ahead of ADM Defender's geo-drops (THE CI fix).
+fw_rule_present() { "$NFT" list chain $FW_TABLE $FW_CHAIN 2>/dev/null | grep "dport $PORT" | grep -q accept; }
+log "-- firewall geo-bypass for :$PORT --"
+if [ ! -x "$NFT" ]; then
+  warn "nft not at $NFT — cannot manage geo-bypass (CI from non-EU IPs will be dropped by defenderd)"
+elif [ "$MODE" = check ]; then
+  if fw_rule_present; then printf '  %-46s %s\n' "$FW_CHAIN: $FW_MATCH" "have: PRESENT"
+  else printf '  %-46s %s\n' "$FW_CHAIN: $FW_MATCH" "have: MISSING (CI from non-EU geo will be dropped)"; fi
+else
+  if fw_rule_present; then ok "firewall: :$PORT geo-bypass already present"
+  else "$NFT" insert rule $FW_TABLE $FW_CHAIN $FW_MATCH 2>/dev/null && ok "firewall: inserted :$PORT geo-bypass (ahead of geo-drops)" || warn "firewall: nft insert failed"; fi
+fi
+
 # 3) binary-patch presence check (do NOT auto re-patch — that's the .py scripts' job)
 log "-- binary-patch presence --"
 [ -f "$SECCOMP_BAK" ]  && ok "seccomp patch applied"   || warn "seccomp patch NOT applied — run: sudo python3 patch-seccomp.py"
@@ -202,6 +230,11 @@ cat > "$WATCHDOG" <<WD
 # Restart Asustor sftpmand if port $PORT is not listening, and re-assert the
 # burst sysctls (reboot-proof persistence). Installed by fix-sftp-cicd.sh.
 for kv in $SYSCTL_KV; do sysctl -w "\$kv" >/dev/null 2>&1; done
+# re-assert the :$PORT geo-bypass — ADM Defender flushes its Filter chain on
+# reload, which would re-drop CI traffic from non-EU (US GitHub) source IPs.
+if [ -x "$NFT" ] && ! "$NFT" list chain $FW_TABLE $FW_CHAIN 2>/dev/null | grep "dport $PORT" | grep -q accept; then
+  "$NFT" insert rule $FW_TABLE $FW_CHAIN tcp dport $PORT ct state new accept 2>/dev/null && logger -t sftp-watchdog "re-asserted :$PORT geo-bypass" 2>/dev/null || true
+fi
 if command -v ss >/dev/null 2>&1; then ss -tln 2>/dev/null | grep -q ":$PORT " && exit 0
 else netstat -tln 2>/dev/null | grep -q ":$PORT " && exit 0; fi
 logger -t sftp-watchdog "port $PORT down — restarting sftpmand" 2>/dev/null || true
