@@ -8,7 +8,7 @@ granted sudo/ADM admin via UNIX `administrators` membership.
 Patches ONLY the "administrators" string that immediately follows the
 "DefaultAllowGroups" symbol — other "administrators" references
 (Is_Nas_Administrators_Member, log messages) are left intact so
-legitimate admin checks still function for admin/sysadmin.
+legitimate admin checks still function for Kelvin/admin.
 
 Replacement is "users" (5 bytes + null) padded with 9 nulls to keep
 the 15-byte slot identical → no shift in subsequent offsets.

@@ -45,7 +45,7 @@ Each line is `<ip>;<netmask>;<flag>`. Example:
 
 ```
 198.51.100.7;0.0.0.0;0
-10.10.10.99;0.0.0.0;0
+192.168.1.99;0.0.0.0;0
 ```
 
 - `<ip>` — IPv4 dotted-quad
@@ -74,14 +74,14 @@ runner IP ranges via `--include`. Three CIDR-emission modes:
 
 ```bash
 # COMMON CASE — self-hosted runners on LAN; auto mode handles your /24
-./whitelist-cicd.sh --custom "10.10.10.0/24,203.0.113.42" --dry-run
+./whitelist-cicd.sh --custom "192.168.1.0/24,203.0.113.42" --dry-run
 
 # Apply (sudo on NAS)
-sudo ./whitelist-cicd.sh --custom "10.10.10.0/24,203.0.113.42" --apply
+sudo ./whitelist-cicd.sh --custom "192.168.1.0/24,203.0.113.42" --apply
 
 # WITH GitHub hosted-runner ranges (publicly-reachable NAS only — rare)
 # Auto mode emits ~20 netmask lines instead of 500k individual IPs
-./whitelist-cicd.sh --include github,gitlab --custom 10.10.10.0/24 --dry-run
+./whitelist-cicd.sh --include github,gitlab --custom 192.168.1.0/24 --dry-run
 
 # Test netmask-matching support on YOUR ADM first
 ./whitelist-cicd.sh --custom 10.99.99.0/24 --cidr-mode netmask --apply
@@ -139,347 +139,79 @@ After applying the whitelist:
 
 ---
 
-# SFTP daemon crash-loop — OpenSSH seccomp + missing `/var/log/lastlog`
+# The SFTP service is `sftpmand` on port 4589 — NOT the main sshd
 
-A second, independent failure mode on Asustor 4.2.5.RN33+ firmware that
-also surfaces to `artifact-nas` users as "NAS is unreachable":
+The single most confusing thing about this appliance: **CI's SFTP and your
+interactive SSH login are two different daemons.**
 
-```
-sshd-session: error: mm_reap: preauth child terminated by signal 31
-kernel audit: comm="sshd-session" sig=31 syscall=87 code=0x0
-```
+| Daemon | Port | Binary | Config | Serves |
+|---|---|---|---|---|
+| main `sshd` | 2324 (custom) | `/usr/sbin/sshd` | `/usr/etc/ssh/sshd_config` (`Subsystem sftp /bin/false`) | your interactive admin login |
+| **`sftpmand`** | **4589** | `/usr/builtin/sbin/sftpmand` | `/usr/builtin/etc/sshd_config_sftp` (`Port 4589`, `AllowGroups users`, `Subsystem sftp internal-sftp`, `ForceCommand internal-sftp`) | **the `artifact-nas` / `asd-cicd` SFTP** |
 
-**Root cause:** `PrintLastLog yes` (default in `sshd_config_sftp`) makes
-OpenSSH's preauth privsep child write to `/var/log/lastlog`. On recent
-Asustor builds that file does not exist; OpenSSH's write path includes
-`unlink(2)` (syscall 87 on x86_64) which is NOT in the preauth seccomp
-filter's allowlist. The kernel kills the child with `SIGSYS` (signal 31).
-Every connection crashes. OpenSSH's `PerSourcePenalties` (built into
-9.8+) starts dropping further connections from the same source IP with
-`penalty: caused crash`. Eventually the Asustor service supervisor
-SIGTERMs the master sshd because too many children died — the listener
-disappears off port 4589 and `artifact-nas` uploads get
-`connection refused`. From the client side this looks identical to
-ipblock having banned the runner — but it's a different problem at a
-different layer.
+So **"I can still SSH in"** (2324) tells you nothing about whether CI's 4589 is
+up. Diagnose 4589 specifically:
 
-## Asustor has TWO SFTP config files
-
-```
-/usr/builtin/etc.default/sshd_config_sftp   ← defaults; firmware updates restore from here
-/usr/builtin/etc/sshd_config_sftp           ← runtime; what the daemon actually reads
+```sh
+ps -ef | grep '[s]ftpmand'        # is the daemon alive?
+ss -tlnp | grep :4589             # is it listening?
 ```
 
-Patching only the runtime works until the next firmware update, which
-may copy defaults → runtime and undo your fix. `fix-sftp-seccomp-crash.sh`
-patches BOTH and adds a `@reboot` cron guard that recreates the lastlog
-file even if it gets wiped by future updates.
+`sftpmand` is gated on `confutil -get /usr/builtin/etc/sftp.conf "" enable` ==
+`Yes` and started by `/usr/builtin/etc/init.d/S79sftpmand`. Connections fork
+`sshd-session`, which is subject to the two binary patches below.
 
-## Usage
+## Two binary patches `sshd-session` needs (`nas/asustor/`)
 
-```bash
-# Apply the persistent fix (writes backups; idempotent — safe to re-run):
-sudo sh fix-sftp-seccomp-crash.sh
+ADM ships `/usr/bin/sshd-session` with two independent bugs that both surface
+as "port 4589 unreachable" — **both** must be applied:
 
-# Inspect current state, no changes:
-sudo sh fix-sftp-seccomp-crash.sh --check
+1. **`patch-sshd-session.py`** — ADM hardcodes `DefaultAllowGroups =
+   "administrators"`; CI users (group `users`) are rejected as NOUSER. Patches
+   the embedded string to `"users"`.
+2. **`patch-seccomp.py`** — the preauth privsep seccomp filter's default action
+   is `KILL_THREAD`; something in the monitor calls `unlink` (syscall 87), so
+   sessions crash with `SIGSYS` (`dmesg`: `sig=31 … syscall=87`), escalate
+   `PerSourcePenalties`, and eventually the service supervisor drops the 4589
+   listener. Flips the BPF default to `ALLOW`. Idempotent; refuses to write if
+   the binary doesn't match (offset drift across firmware builds → re-find).
 
-# After running + a few new connections, confirm no new seccomp kills:
-sudo sh fix-sftp-seccomp-crash.sh --verify
+## Recovery + boot-persistence (the durable fix)
+
+ADM **regenerates `/usr/etc` and resets `/usr/bin/sshd-session` on reboot /
+firmware update**, which un-patches the binary and lets `sftpmand` die without
+auto-restarting — the recurring "4589 was working, now it's refused" cycle.
+
+Recovery is a single idempotent script (`asd-nas-recover.sh`): re-apply both
+patches → restart `sftpmand` → `HUP` the main sshd (clears penalties) → verify
+4589. Persist the script + the seccomp patch on the **data volume** (`/usr/local`
+is on the RAID and survives firmware resets, unlike `/usr/etc`) and wire it to
+`@reboot`:
+
+```sh
+# persistent home (survives firmware resets):
+/usr/local/sbin/patch-sshd-session.py
+/usr/local/sbin/patch-seccomp.py
+/usr/local/sbin/asd-nas-recover.sh
+
+# root crontab (/usr/builtin/etc/crontabs/root): run full recovery on boot
+@reboot sleep 45 && /bin/sh /usr/local/sbin/asd-nas-recover.sh >> /var/log/asd-nas-recover.log 2>&1
+
+# manual run any time 4589 is down:
+sudo sh /usr/local/sbin/asd-nas-recover.sh
 ```
 
-The fix restarts the SFTP service via `/usr/bin/serviceutil sshd
-restart` (Asustor's CLI service tool — bypasses the ADM web UI toggle,
-which is unreliable when the service is in the crash-loop).
+`sleep 45` lets the stock `S79sftpmand` + filesystem come up first, then the
+recovery re-patches and restarts cleanly on top.
 
-## How this relates to the ipblock whitelist
+## Intermittent empty `readdir` under load
 
-Different problems, both produce "NAS unreachable" to `artifact-nas`:
-
-| Layer | Symptom (client-side) | Symptom (NAS-side) | Fix |
-|---|---|---|---|
-| ipblock IP-ban | `Connection reset by peer` during kex | `Failed publickey` in defenderd logs | `whitelist-cicd.sh` |
-| seccomp crash | `Connection refused` (port closed) | `sig=31 syscall=87` in dmesg | `fix-sftp-seccomp-crash.sh` |
-
-Run both if you've seen either symptom — they don't conflict.
-
----
-
-# REAL root cause (corrected): hardcoded `DefaultAllowGroups = "administrators"`
-
-After exhaustive triage on a live Asustor AS6706T running ADM 4.2.5
-(2026-05-28), the SIGSYS crashes documented above turned out to be a
-SECONDARY symptom of a different root cause. Capturing it here so the
-next person doesn't waste hours like we did:
-
-## The actual bug
-
-Asustor patched OpenSSH 9.8p1 with a hardcoded **`DefaultAllowGroups = "administrators"`**.
-The string `"administrators\0"` sits at file offset **551273** in
-`/usr/bin/sshd-session` (immediately following the `"DefaultAllowGroups"`
-symbol at 551254). Source: `strings /usr/bin/sshd-session | grep -B1 administrators`.
-
-When a user connects, sshd checks group membership against this
-hardcoded value EVEN IF the config has `AllowGroups` set to something
-else (the patch checks BOTH). Any user not in the UNIX `administrators`
-group (`/etc/group: administrators:x:999:admin,sysadmin`) gets treated
-as `NOUSER` (anti-enumeration downgrade) and rejected at auth.
-
-**Note (corrected 2026-05-28 evening)**: An earlier revision of this
-file claimed the AllowGroups patch ALSO fixes the SIGSYS / unlink
-crashes. That was wrong. The two are independent:
-
-- **DefaultAllowGroups patch** (`patch-sshd-session.py`) — fixes user
-  rejection. The `users`-group user can now authenticate.
-- **Seccomp default-action patch** (`patch-seccomp.py`) — fixes the
-  unrelated SIGSYS-on-`unlink`. The unlink call lives in OpenSSH's
-  preauth privsep monitor cleanup and fires for **every** session,
-  not just NOUSER-rejected ones. Stock OpenSSH 9.8p1's seccomp filter
-  doesn't allow `unlink` (syscall 87 on x86_64) → child crashes →
-  `PerSourcePenalties` drops further connections → eventually the
-  Asustor service supervisor SIGTERMs the master listener and port
-  4589 disappears off the network.
-
-So the visible-from-outside symptom is `connection refused` /
-`connection reset by peer` from rclone, the visible-on-NAS symptom is
-the SIGSYS audits + sshd master flapping. **You need both patches** to
-permanently fix this — one is a no-op for the other's issue.
-
-## The fix — `patch-sshd-session.py`
-
-Surgical binary patch: replaces the 15-byte slot `"administrators\0"`
-with `"users\0\0\0\0\0\0\0\0\0\0"` (5 chars + 10 null padding).
-C reads up to the first null → sees `"users"`. The padding keeps the
-file size and all subsequent offsets identical (no relocations break).
-
-```bash
-sudo python3 nas/asustor/patch-sshd-session.py
-sudo pkill -f 'sshd -f /usr/builtin/etc/sshd_config_sftp'; sleep 1
-sudo /usr/sbin/sshd -f /usr/builtin/etc/sshd_config_sftp
-```
-
-After patching:
-- Users in `users` group (the default primary group for Asustor users
-  created via ADM UI) pass the AllowGroups check
-- Auth proceeds normally — key or password
-- UNIX `administrators` group membership is STILL meaningful for sudo
-  + ADM admin role (other `administrators` references in the binary,
-  the `%administrators ALL=(ALL:ALL) ALL` sudoers line, and
-  `Is_Nas_Administrators_Member` are unchanged)
-
-Reversal: `sudo cp /usr/bin/sshd-session.asustor-original /usr/bin/sshd-session`
-(the script auto-backs up before patching).
-
-## Companion fix — `patch-seccomp.py` (the SIGSYS crashes)
-
-After the AllowGroups patch lands, you may still see periodic SIGSYS
-crashes in the `sshd-session` audit log:
-
-```
-kernel: audit: type=1326 comm="sshd-session" sig=31 syscall=87 (unlink)
-sshd-session: error: mm_reap: preauth child terminated by signal 31
-sshd[N]: Session process X unpriv child crash for connection from ...
-sshd[N]: drop connection #0 ... penalty: caused crash
-```
-
-These come from a separate problem: OpenSSH 9.8p1's preauth privsep
-seccomp filter doesn't allow `unlink` (syscall 87), but **something
-in the Asustor build's preauth path calls it** (likely a privsep IPC
-cleanup, possibly a `shm_unlink` reduced to `unlink` under the
-appliance's libc). Every Nth session crashes; PerSourcePenalties
-escalates that to "drop all from this IP" within a few minutes.
-
-### The fix
-
-`patch-seccomp.py` flips the BPF filter's default action from
-`SECCOMP_RET_KILL_THREAD` (the `KILL` at file offset **0x90988**, the
-LAST `RET` instruction of the filter) to `SECCOMP_RET_ALLOW`. This is
-a single 4-byte change to the instruction's `k` field.
-
-```bash
-sudo python3 nas/asustor/patch-seccomp.py
-sudo /usr/builtin/etc/init.d/S79sftpmand stop
-sudo /usr/builtin/etc/init.d/S79sftpmand start
-```
-
-What stays intact:
-
-- The **arch-mismatch kill** at offset 0x90350 (the first `RET KILL`,
-  guarding against x86_64-ABI mismatch) — kept, important safety check.
-- All **explicit `SC_DENY`** rules returning `EACCES` for `open`,
-  `openat`, `lstat`, `fstat`, `newfstatat`, `stat`, `shmget`, `shmat`,
-  `shmdt`, `statx`, `brk` — these continue to deny what they always did.
-- All **explicit `SC_ALLOW`** rules for ~100 syscalls — unchanged.
-
-What changes:
-
-- Implicit-default for "syscall not listed" flips from `KILL` to
-  `ALLOW`. The privsep monitor child still runs setuid-restricted +
-  chrooted; the seccomp belt is loosened only on the "unspecified
-  syscall" axis.
-
-The patch uses **write-to-tmp + atomic rename** to dodge `ETXTBSY`
-("Text file busy") on live sshd-session children — running children
-keep the old inode; fresh `execve()`s pick up the new one. Backs up
-to `/usr/bin/sshd-session.before-seccomp-patch` on first run.
-
-Reversal: `sudo cp /usr/bin/sshd-session.before-seccomp-patch /usr/bin/sshd-session`
-(but you'll lose the AllowGroups fix too — that backup is from before
-either patch; if both were applied, restore the layered backups in
-reverse order).
-
-## **Required after firmware updates**
-
-Asustor firmware updates may replace `/usr/bin/sshd-session`. Both
-patch scripts are idempotent — re-run them in order after any ADM
-upgrade. Add to your post-upgrade checklist:
-
-```bash
-sudo python3 nas/asustor/patch-sshd-session.py   # AllowGroups
-sudo python3 nas/asustor/patch-seccomp.py        # SIGSYS default-action
-sudo /usr/builtin/etc/init.d/S79sftpmand stop; sleep 1
-sudo /usr/builtin/etc/init.d/S79sftpmand start
-sudo killall -HUP sshd 2>/dev/null               # clear PerSourcePenalties
-ss -tlnp | grep -E ':4589|:2324'                 # verify both ports listen
-```
-
----
-
-# Per-user setup playbook
-
-Every new SFTP user added to the NAS for artifact-nas use needs the
-following. The binary patch is one-time per appliance; everything
-else is per-user.
-
-| Step | Where | Command / Action |
-|---|---|---|
-| 1. Create UNIX user | NAS (one-time) | Asustor ADM UI → Users → Add. Primary group: `users` (default). Do NOT add to `administrators`. |
-| 2. Verify primary GID | NAS | `id <user>` should show `gid=100(users)` |
-| 3. Prepare `.ssh` dir | NAS | `sudo install -d -m 700 -o <user> -g users /home/<user>/.ssh` |
-| 4. Drop pubkey | NAS | `sudo tee /home/<user>/.ssh/authorized_keys < your-key.pub; sudo chown <user>:users /home/<user>/.ssh/authorized_keys; sudo chmod 600 /home/<user>/.ssh/authorized_keys` |
-| 5a. AllowGroups binary patch | NAS (one-time per appliance, idempotent) | `sudo python3 patch-sshd-session.py` — flips hardcoded `administrators` → `users` |
-| 5b. Seccomp default-action patch | NAS (one-time per appliance, idempotent) | `sudo python3 patch-seccomp.py` — flips BPF default `KILL_THREAD` → `ALLOW`; fixes the independent SIGSYS-on-`unlink` crashes that survive 5a |
-| 6. Generate rclone profile | Local | Use the inline `key_pem` form so it ships in ONE secret. See template below. |
-| 7. Push RCLONE_CONF_B64 | Local | `base64 -w0 rclone.conf \| gh secret set RCLONE_CONF_B64 --org <ORG> --visibility all` |
-| 8. Push NAS_DEST | Local | `echo "/home/<user>/ci-artifacts" \| gh secret set NAS_DEST --org <ORG> --visibility all` (NOTE: lowercase `/home/...` — `/Home` is NOT a valid path on most Asustor builds) |
-| 9. Verify | Local | `RCLONE_CONFIG=./rclone.conf rclone lsd <remote>:` (should list the user's home content), `RCLONE_CONFIG=./rclone.conf rclone copy testfile <remote>:/home/<user>/ci-artifacts/test/` |
-
-## rclone.conf template (inline ed25519 key, one-secret)
-
-```ini
-[my-nas]
-type = sftp
-host = <PUBLIC_IP_OR_DDNS>
-user = <USER>
-port = <PORT>
-key_pem = -----BEGIN OPENSSH PRIVATE KEY-----\n
-   ... base64 blob, newlines preserved as \n ...\n
-   -----END OPENSSH PRIVATE KEY-----\n
-shell_type = unix
-connect_timeout = 10s
-timeout = 20s
-md5sum_command = none
-sha1sum_command = none
-```
-
-Build the `key_pem` line by collapsing the private key with literal
-`\n` for newlines:
-
-```bash
-awk '{printf "%s\\n", $0}' ~/.ssh/cicd_ed25519 | sed 's/\\n$//'
-```
-
-## Things that look like fixes but aren't
-
-If you see SIGSYS audits on `/var/log/messages` from `sshd-session`
-with `syscall=87` (unlink), it is tempting to fix:
-- `/var/log/lastlog` missing → `touch` it
-- `/var/log/btmp` perms → `chmod 600`
-- `pam_google_authenticator` required → make optional
-- `UsePAM yes` → `UsePAM no`
-- `ipblockman` syscalls → no-op shim
-- `PrintLastLog no` in `sshd_config_sftp`
-
-**Don't.** Each scratches one surface symptom but the real bugs are
-in the binary itself:
-
-1. Hardcoded `DefaultAllowGroups = "administrators"` rejects non-admin
-   users — fixed by `patch-sshd-session.py`.
-2. Preauth seccomp filter doesn't allow `unlink` — fixed by
-   `patch-seccomp.py`. The unlink call is in OpenSSH's privsep monitor
-   cleanup path; it runs for every session regardless of auth outcome.
-
-Patch BOTH, leave the rest alone. Configuration tweaks on the periphery
-mask the symptoms transiently and rot back on the next ADM update.
-
----
-
-# THIRD layer (post-patch): the master dies under a concurrent burst — `fix-sftp-cicd.sh`
-
-The two binary patches fix per-connection **crashes**. They do not make
-the SFTP service survive **concurrency**. Re-verified on AS6706T / ADM
-4.2.5 / OpenSSH_9.8p1 (2026-05-31), with both patches already applied
-(`sshd-session.asustor-original` + `sshd-session.before-seccomp-patch`
-backups present):
-
-- A single handshake to `localhost:4589` succeeds cleanly.
-- A burst of 50 concurrent connections produced **zero new `sig=31`
-  audits** (the seccomp patch holds) — but also dropped ~⅓ of
-  connections (`kex_exchange_identification` / connection-closed), and
-  after a few repeated bursts the **`sftpmand` supervisor and the
-  `sshd_sftp` listener both exited and port 4589 stayed down**. Asustor
-  did **not** auto-restart them.
-
-That is the failure CI actually hits: parallel `rclone` uploads + retry
-storms burst the listener, the master falls over, and every subsequent
-upload gets `connection refused` / `EOF` until someone restarts the
-service by hand. Three stock-config facts drive it:
-
-| Fact | Stock value | Effect under CI burst |
-|---|---|---|
-| `MaxStartups` | unset → `10:30:100` | random-early-drop past 10 pre-auth conns → `EOF` |
-| `PerSourcePenalties` | on (9.8 default) | one busy runner IP gets progressively dropped |
-| ipblock `Login_Attempt`/`Block_Time` | `1` / `0` | **permaban after a single failed auth** (manual clear only) |
-
-This is a different layer from the binary patches, so it gets its own
-script — `fix-sftp-cicd.sh` — which does **only** the concurrency +
-resilience work (it does not re-patch the binary, and deliberately does
-not touch `PrintLastLog`):
-
-1. Raises `MaxStartups 200:30:1000`, `MaxSessions 100`,
-   `PerSourceMaxStartups 100`, and sets `PerSourcePenalties no` — in
-   **both** config copies (runtime + `etc.default`).
-2. Loosens ipblock from permaban to a self-healing window
-   (`Login_Attempt=10`, `Time_Period=300`, `Block_Time=600`).
-3. Installs `/usr/local/sbin/sftp-cicd-watchdog.sh` + a per-minute cron
-   that restarts `sftpmand` whenever port 4589 is down — so even if a
-   burst still knocks it over, it comes back within a minute instead of
-   staying dead.
-4. Restarts the service and verifies the port listens.
-
-```bash
-sudo sh fix-sftp-cicd.sh            # apply (idempotent; writes .cicd-bak backups)
-sudo sh fix-sftp-cicd.sh --check    # diff current vs desired, no changes
-sudo sh fix-sftp-cicd.sh --verify   # patch-state + listener + new-sig=31 report
-```
-
-## Run order (full fix from a fresh / firmware-reset NAS)
-
-```bash
-sudo python3 patch-sshd-session.py   # AllowGroups → users
-sudo python3 patch-seccomp.py        # SIGSYS-on-unlink → ALLOW
-sudo sh     fix-sftp-cicd.sh         # concurrency + ipblock + watchdog + restart
-sudo sh     fix-sftp-cicd.sh --verify
-```
-
-## Honest caveat — this is mitigation, not a stable server
-
-Even with all three layers, the Asustor master is a fragile listener
-fronted by a watchdog: a hard enough burst can still drop it for up to
-a minute before the cron brings it back. If CI needs a genuinely stable
-SFTP endpoint, a plain OpenSSH/SFTP **container** (sane `MaxStartups`,
-no `ipblock` supervisor, no vendor-patched binary) on the NAS host is
-the durable answer; these scripts are the keep-it-working-today path.
-The client-side belt is to keep `rclone` concurrency modest in the
-`artifact-nas` upload/download actions (`--transfers`/`--checkers`) so
-CI never bursts the listener in the first place.
+Even when healthy, `sftpmand` (`internal-sftp`) can occasionally return an
+**empty directory listing for a populated dir** when many CI connections hit it
+at once (uploads + cross-runner reads during a full release matrix). It's rare,
+load-dependent, and not reproducible in isolation (a sequential and a 6-way
+concurrent probe were both 0-failure). The `artifact-nas` action mitigates it
+(v1.4.6 zero-gain retry) and v1.4.7's `RUN_ID`-only path makes
+`gh run rerun <id> --failed` a reliable recovery — see the action README's
+"Reliability hardening" section. Loosening `MaxStartups` in `sshd_config_sftp`
+may help but is unverified on this firmware.

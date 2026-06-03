@@ -182,17 +182,45 @@ runs:
 
         # --- source ---
         # Standard (fallback/nas-only): mirror upload's per-run layout
-        #   <dest>/<owner/repo>/<run_id>-<attempt>/<name>/
+        #   <dest>/<owner/repo>/<run_id>/<name>/  (RUN_ID only — see upload
+        #   action: attempt-scoping broke `--failed` re-runs since the
+        #   succeeded producer doesn't re-run/re-upload at the new attempt)
         # Cache mode: stable cross-run path the upload-side cache mode
         # wrote to:
         #   <dest>/cache/<name>/
         if [ "${MODE}" = "cache" ]; then
           SRC_DIR="${NAS_DEST%/}/cache/${ART_NAME}"
         else
-          SRC_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
+          SRC_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${ART_NAME}"
         fi
-        echo "NAS source: ${REMOTE}:${SRC_DIR} -> ${DEST_PATH}"
-        mkdir -p "${DEST_PATH}"
+        echo "NAS source: ${REMOTE}:${SRC_DIR}"
+
+        # --- parse multi-line DEST_PATH into individual items ---
+        # Mirrors upload/action.yml's per-item iteration. Without this,
+        # multi-line `path:` ended up dumped under DEST_PATH's first line.
+        declare -a ITEMS=()
+        while IFS= read -r line; do
+          line="${line//$'\r'/}"
+          [ -z "${line}" ] && continue
+          for m in ${line}; do
+            # ~ expansion — bash doesn't expand it inside quoted strings.
+            # The prefix-removal pattern MUST be quoted ("~/") to suppress
+            # the parameter-expansion's tilde-expansion: ${m#~/} would
+            # expand the pattern to ${HOME}/ before matching, so the
+            # literal "~/.bun" never matches and nothing is stripped —
+            # leaving m="${HOME}/~/.bun" with a literal tilde dir.
+            case "${m}" in
+              "~/"*) m="${HOME}/${m#"~/"}" ;;
+              "~")   m="${HOME}" ;;
+            esac
+            ITEMS+=("${m}")
+          done
+        done <<< "${DEST_PATH}"
+        # Empty input: behave like the legacy single-target download (root = ".")
+        if [ "${#ITEMS[@]}" -eq 0 ]; then
+          ITEMS=(".")
+        fi
+        echo "Restore targets: ${ITEMS[*]}"
 
         # Hardened flags (v1.2.0):
         #   --sftp-concurrency 1                  one SSH channel at a time —
@@ -224,7 +252,18 @@ runs:
             else
               exit_code=$?
             fi
-            if grep -qiE "NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|connection refused|too many|throttl" "$errlog"; then
+            # "connection refused" is a HARD block — the NAS sshd is down or
+            # this runner's IP is fail2ban-banned. Retrying 5x just hammers
+            # the appliance and SUSTAINS the ban. Fail FAST so the caller
+            # fails over immediately (GitHub-first / cache-miss) instead of
+            # burning ~60s and digging the ban deeper. Distinct from the
+            # transient SFTP-init races below, which a short backoff recovers.
+            if grep -qE "connection refused" "$errlog"; then
+              echo "::warning::NAS connection refused — host down or runner IP fail2ban-banned; not retrying, failing over now"
+              rm -f "$errlog"
+              return "$exit_code"
+            fi
+            if grep -qiE "NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|too many|throttl" "$errlog"; then
               if [ "$attempt" -lt "$max_attempts" ]; then
                 echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
                 sleep "$((backoff + RANDOM % 4))"
@@ -240,28 +279,165 @@ runs:
           rm -f "$errlog"
           return 1
         }
-        # `cache` mode tolerates the source not existing — cache miss is
-        # not an error, just means a prior run hasn't populated this key
-        # yet (or the key changed because inputs changed). For non-cache
-        # modes, missing source IS an error (the upload should have run
-        # before us in the same workflow).
-        if [ "${MODE}" = "cache" ]; then
-          rclone_retry copy "${REMOTE}:${SRC_DIR}" "${DEST_PATH}" "${RC_FLAGS[@]}" || {
-            echo "NAS cache miss: ${ART_NAME} (no files at ${SRC_DIR})"
-            exit 0
-          }
-          if [ -z "$(ls -A "${DEST_PATH}" 2>/dev/null)" ]; then
-            echo "NAS cache miss: ${ART_NAME} (empty at ${SRC_DIR})"
-            exit 0
+        # --- list the SRC_DIR once to learn what's there ---
+        # We use this listing to (a) detect cache miss cheaply (one query
+        # instead of one-failed-copy-per-item) and (b) distinguish files
+        # from directories so we can mirror the upload-side layout — a
+        # directory `node_modules` was uploaded as `<SRC_DIR>/node_modules/`,
+        # so we restore by copying `<SRC_DIR>/node_modules` (a dir) INTO
+        # the local `node_modules` dir (rclone copies CONTENTS). A file
+        # `.env` was uploaded as `<SRC_DIR>/.env`, restored by copying
+        # the remote file into its local PARENT (rclone copy file → dir
+        # uses the file's basename for the destination filename).
+        #
+        # `lsf --max-depth 1` lists immediate children; entries ending in
+        # `/` are dirs, otherwise files. Empty output = cache-miss (the
+        # SRC_DIR doesn't exist on the remote). `|| true` because lsf on
+        # a missing remote dir exits non-zero — that's the cache-miss
+        # signal in `mode: cache`, and a hard error elsewhere (handled
+        # via the ANY_HIT check below).
+        REMOTE_LISTING="$(rclone_retry lsf --max-depth 1 "${REMOTE}:${SRC_DIR}/" "${RC_FLAGS[@]}" 2>/dev/null || true)"
+
+        # --- LEGACY single-target case ----------------------------------
+        # `path: .` (or any single root-like destination) means "dump
+        # everything in SRC_DIR into this dir". This matches the v1.4.1
+        # contract and is what windows-ci.yml's `Download pre-generated
+        # build resources` step relies on — it ships 3 files
+        # (symbols.json + tpl-defaults.json + skills.json) and the
+        # consumer just wants them placed at the repo root.
+        #
+        # Detection: a single item that is `.`, `./`, `/`, or empty.
+        # For these, fall through to the legacy single-rclone-copy path.
+        if [ "${#ITEMS[@]}" -eq 1 ]; then
+          single="${ITEMS[0]}"
+          case "${single}" in
+            "." | "./" | "/" | "")
+              mkdir -p "${single:-.}"
+              if rclone_retry copy "${REMOTE}:${SRC_DIR}" "${single:-.}" "${RC_FLAGS[@]}"; then
+                if [ -n "$(ls -A "${single:-.}" 2>/dev/null)" ]; then
+                  if [ "${MODE}" = "cache" ]; then
+                    echo "✅ NAS cache HIT: ${ART_NAME} -> ${single}"
+                  else
+                    echo "✅ Artifact '${ART_NAME}' downloaded from NAS -> ${single}"
+                  fi
+                  exit 0
+                fi
+              fi
+              if [ "${MODE}" = "cache" ]; then
+                echo "NAS cache miss: ${ART_NAME} (no files under ${SRC_DIR})"
+                exit 0
+              fi
+              echo "::error::NAS download produced no files from ${REMOTE}:${SRC_DIR}" >&2
+              exit 1
+              ;;
+          esac
+        fi
+
+        # --- per-item restore (multi-line path OR single named target) ---
+        ANY_HIT=0
+        for item in "${ITEMS[@]}"; do
+          base="$(basename "${item}")"
+          parent="$(dirname "${item}")"
+          mkdir -p "${parent}"
+          if echo "${REMOTE_LISTING}" | grep -qFx "${base}/"; then
+            # Source is a directory → restore CONTENTS into ${item}
+            mkdir -p "${item}"
+            if rclone_retry copy "${REMOTE}:${SRC_DIR}/${base}" "${item}" "${RC_FLAGS[@]}"; then
+              [ -n "$(ls -A "${item}" 2>/dev/null)" ] && ANY_HIT=1
+            fi
+          elif echo "${REMOTE_LISTING}" | grep -qFx "${base}"; then
+            # Source is a single file → drop into ${parent} (rclone uses
+            # the source's basename for the resulting filename).
+            if rclone_retry copy "${REMOTE}:${SRC_DIR}/${base}" "${parent}" "${RC_FLAGS[@]}"; then
+              [ -e "${item}" ] && ANY_HIT=1
+            fi
           fi
-          echo "✅ NAS cache HIT: ${ART_NAME} -> ${DEST_PATH}"
+          # else: item not present on remote → skip silently. In `mode:
+          # cache` that's a partial miss (one item not in cache, others
+          # may still be). In non-cache modes we error below if NOTHING
+          # was restored.
+        done
+
+        # --- outcome ---
+        # `cache` mode tolerates the source not existing — cache miss is
+        # not an error, just means a prior run hasn't populated this key.
+        # For non-cache modes, missing source IS an error (the upload
+        # should have run before us in the same workflow).
+        # --- legacy fallback for single-target callers ----------------
+        # If per-item missed for the only target AND the remote IS
+        # populated (REMOTE_LISTING non-empty), the caller used a name
+        # that doesn't match upload's basename — e.g. download
+        # `path: dist/` paired with upload `path: dist/asd-linux-x64.tar.gz`
+        # (file). Upload's file-branch flattens: remote has
+        # `<SRC_DIR>/asd-linux-x64.tar.gz`, no `dist/` entry. v1.4.1's
+        # unconditional `rclone copy SRC_DIR DEST_PATH` handled this
+        # transparently; the per-item logic in v1.4.2/v1.4.3 doesn't.
+        # release.yml has ~14 such call sites (path: dist/, path: scripts/,
+        # path: metadata/, ...) — they break on the first nas-only path.
+        # Fall through to the legacy `rclone copy SRC_DIR ITEM` semantic
+        # to restore that compatibility. Multi-line callers don't hit
+        # this path (the ANY_HIT=0 with multi-line genuinely means
+        # nothing matched, which is the cache-miss / error case).
+        #
+        # v1.4.5: do NOT gate this on `[ -n "${REMOTE_LISTING}" ]`. The
+        # `lsf` used to populate REMOTE_LISTING is wrapped in
+        # `2>/dev/null || true`, so it returns EMPTY both on a genuine
+        # empty dir AND on any lsf error (e.g. the Asustor sftpmand server
+        # returned no entries / errored on readdir even though the file is
+        # demonstrably on disk — observed 2026-05-29: upload landed a 77MB
+        # zip, the download's lsf came back empty in 0.2s, the fallback was
+        # skipped, "produced no files"). Gating the copy on lsf turned a
+        # flaky LIST into a hard download failure. A single-target caller
+        # (`path: dist/`) just wants "dump SRC_DIR here" — so attempt the
+        # direct copy unconditionally and judge success by whether files
+        # actually arrived (BEFORE/AFTER count), which is the real signal.
+        if [ "${ANY_HIT}" -eq 0 ] && [ "${#ITEMS[@]}" -eq 1 ]; then
+          single="${ITEMS[0]}"
+          mkdir -p "${single}"
+          # v1.4.6 — retry on a ZERO-GAIN copy. The Asustor sftpmand
+          # readdir is intermittently flaky: `rclone copy` of a populated
+          # SRC_DIR can return exit 0 having transferred NOTHING because
+          # the server's directory listing came back empty on that call.
+          # `rclone_retry` does NOT catch this (the copy "succeeds", exit 0),
+          # so a single transient empty-readdir was a hard download failure
+          # (observed 2026-05-29: install-scripts gained 0 files 35s after a
+          # confirmed-good upload, while a sibling download succeeded seconds
+          # earlier). Retry the copy when it gains nothing from a source we
+          # expect to be populated. `cache` mode tolerates a genuine miss
+          # (no retry storm — break on first zero-gain). Snapshot BEFORE so
+          # we count only actually-new files (avoids the v1.4.3 pre-existing-
+          # dir false positive).
+          st_attempt=1; st_max=4; st_backoff=2
+          while [ "${st_attempt}" -le "${st_max}" ]; do
+            BEFORE_COUNT=$(find "${single}" -mindepth 1 2>/dev/null | wc -l)
+            rclone_retry copy "${REMOTE}:${SRC_DIR}" "${single}" "${RC_FLAGS[@]}" || true
+            AFTER_COUNT=$(find "${single}" -mindepth 1 2>/dev/null | wc -l)
+            if [ "${AFTER_COUNT}" -gt "${BEFORE_COUNT}" ]; then
+              ANY_HIT=1
+              echo "Single-target restore: ${single} (gained $((AFTER_COUNT - BEFORE_COUNT)) entries, attempt ${st_attempt})"
+              break
+            fi
+            [ "${MODE}" = "cache" ] && break  # genuine cache miss — don't retry
+            if [ "${st_attempt}" -lt "${st_max}" ]; then
+              echo "::warning::single-target copy gained 0 files from ${SRC_DIR} (sftpmand readdir glitch?) — retry ${st_attempt}/${st_max} in ${st_backoff}s"
+              sleep "${st_backoff}"
+              st_backoff=$((st_backoff * 2))
+            fi
+            st_attempt=$((st_attempt + 1))
+          done
+        fi
+
+        if [ "${MODE}" = "cache" ]; then
+          if [ "${ANY_HIT}" -eq 1 ]; then
+            echo "✅ NAS cache HIT: ${ART_NAME} -> ${ITEMS[*]}"
+          else
+            echo "NAS cache miss: ${ART_NAME} (nothing under ${SRC_DIR})"
+          fi
           exit 0
         fi
 
-        rclone_retry copy "${REMOTE}:${SRC_DIR}" "${DEST_PATH}" "${RC_FLAGS[@]}"
-
-        if [ -z "$(ls -A "${DEST_PATH}" 2>/dev/null)" ]; then
+        if [ "${ANY_HIT}" -eq 0 ]; then
           echo "::error::NAS download produced no files from ${REMOTE}:${SRC_DIR}" >&2
           exit 1
         fi
-        echo "✅ Artifact '${ART_NAME}' downloaded from NAS -> ${DEST_PATH}"
+        echo "✅ Artifact '${ART_NAME}' downloaded from NAS -> ${ITEMS[*]}"

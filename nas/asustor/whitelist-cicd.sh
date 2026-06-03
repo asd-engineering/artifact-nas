@@ -25,7 +25,7 @@
 #                          gitlab     (documented gitlab.com runner ranges)
 #   --custom CIDR,...    THE THING YOU PROBABLY WANT: CIDRs/IPs to
 #                        whitelist (e.g. self-hosted runner LAN:
-#                        10.10.10.0/24, public IP: 203.0.113.42).
+#                        192.168.1.0/24, public IP: 203.0.113.42).
 #                        For a typical CI setup this is the only flag
 #                        you need.
 #   --cidr-mode MODE     How to write CIDR ranges (v1.4.0+):
@@ -49,7 +49,7 @@
 #
 # Examples:
 #   # COMMON CASE — whitelist your self-hosted runner LAN + public IP
-#   ./whitelist-cicd.sh --custom "10.10.10.0/24,203.0.113.42" --dry-run
+#   ./whitelist-cicd.sh --custom "192.168.1.0/24,203.0.113.42" --dry-run
 #
 #   # Rare: also whitelist GitHub Actions hosted-runner ranges (large)
 #   ./whitelist-cicd.sh --include github,gitlab --max-expand 20 --dry-run

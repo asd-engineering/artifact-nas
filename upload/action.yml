@@ -222,7 +222,15 @@ runs:
         # --- destination ---
         # Standard (fallback/always/nas-only/nas-first): per-run path so
         # different CI runs don't clobber each other —
-        #   <dest>/<owner/repo>/<run_id>-<attempt>/<artifact>/
+        #   <dest>/<owner/repo>/<run_id>/<artifact>/
+        # NOTE: keyed on GITHUB_RUN_ID only (NOT run_id-run_attempt). A
+        # `--failed` re-run bumps GITHUB_RUN_ATTEMPT for the re-run jobs but
+        # NOT for the already-succeeded producer (build) job — so an
+        # attempt-scoped path made the consumer look at <run>-2/ while the
+        # artifact sat at <run>-1/ → "directory not found". RUN_ID is stable
+        # across attempts, so a re-run's consumer reads the original
+        # producer's upload. Same-run re-uploads overwrite the same path
+        # (idempotent); different runs have different RUN_IDs (no clobber).
         # Cache mode: cross-run stable path so a later run's restore can
         # find what an earlier run wrote —
         #   <dest>/cache/<name>/
@@ -232,17 +240,32 @@ runs:
         if [ "${MODE}" = "cache" ]; then
           DEST_DIR="${NAS_DEST%/}/cache/${ART_NAME}"
         else
-          DEST_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
+          DEST_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${ART_NAME}"
         fi
         echo "NAS destination: ${REMOTE}:${DEST_DIR}"
 
         # --- collect sources (glob-expanded, existing only) ---
+        # Tilde expansion: bash doesn't expand `~` inside double-quoted
+        # parameters, and the for-loop's word-splitting doesn't trigger
+        # it either. Without explicit substitution, `path: ~/.bun`
+        # produces `[ -e "~/.bun" ]` = false (literal tilde dir doesn't
+        # exist) and the item is silently dropped from ITEMS. This
+        # regressed every workspace cache compared to actions/cache@v4
+        # which tilde-expanded natively.
+        #
+        # The prefix-removal pattern MUST be quoted ("~/") to suppress
+        # the parameter-expansion's tilde-expansion of the pattern
+        # itself (see download/action.yml for the same fix).
         shopt -s nullglob
         declare -a ITEMS=()
         while IFS= read -r line; do
           line="${line//$'\r'/}"
           [ -z "${line}" ] && continue
           for m in ${line}; do
+            case "${m}" in
+              "~/"*) m="${HOME}/${m#"~/"}" ;;
+              "~")   m="${HOME}" ;;
+            esac
             [ -e "${m}" ] && ITEMS+=("${m}")
           done
         done <<< "${ART_PATH}"
@@ -278,13 +301,11 @@ runs:
         )
 
         # rclone_retry — wraps an rclone invocation with exponential
+        # backoff specifically for SFTP NewFs failures (server-side queue
         # exhaustion, mid-handshake EOF, sshd restart races). Backoff:
-        # 1s, 3s, 7s, 15s, 31s, 63s (cumulative ~120s across 7 attempts) —
-        # long enough to span TWO cycles of the NAS-side per-minute watchdog
-        # (sftp-cicd-watchdog.sh restarts the Asustor sftpmand master when it
-        # dies under a CI burst; a 57s budget could expire inside a single
-        # ~60s down-window and fall back to GitHub before the master is back).
-        # Still short enough not to balloon a permanently-broken build. Only
+        # 1s, 3s, 7s, 15s, 31s (cumulative ~57s across 5 attempts) — long
+        # enough for sshd's MaxStartups queue to drain after a CI burst,
+        # short enough not to balloon a permanently-broken build. Only
         # retries on init-layer signatures; real errors (auth fail, perm
         # denied) fail immediately.
         rclone_retry() {
@@ -302,7 +323,21 @@ runs:
             else
               exit_code=$?
             fi
-            if grep -qiE "NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|connection refused|too many|throttl" "$errlog"; then
+            # "connection refused" is a HARD block — the NAS sshd is down or
+            # this runner's IP is fail2ban-banned. Retrying 5x just hammers
+            # the appliance and SUSTAINS the ban (each attempt is another
+            # failed connection fail2ban counts). Fail FAST so the caller
+            # fails over immediately (gh-fallback on upload, cache-miss /
+            # GitHub-first on download) instead of burning ~60s and digging
+            # the ban deeper. Distinct from the transient SFTP-init races
+            # below (sshd MaxStartups queue, mid-handshake EOF), which a
+            # short backoff genuinely recovers.
+            if grep -qE "connection refused" "$errlog"; then
+              echo "::warning::NAS connection refused — host down or runner IP fail2ban-banned; not retrying, failing over now"
+              rm -f "$errlog"
+              return "$exit_code"
+            fi
+            if grep -qiE "NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|too many|throttl" "$errlog"; then
               if [ "$attempt" -lt "$max_attempts" ]; then
                 echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
                 sleep "$((backoff + RANDOM % 4))"
@@ -413,14 +448,23 @@ runs:
         fi
         trap '[ -n "${CLEANUP_CONF}" ] && rm -f "${CLEANUP_CONF}"' EXIT
 
-        DEST_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${ART_NAME}"
+        DEST_DIR="${NAS_DEST%/}/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${ART_NAME}"
         echo "NAS destination (nas-first): ${REMOTE}:${DEST_DIR}"
 
+        # See main nas step (lines 240-260) for the tilde-expansion
+        # rationale. Same code path duplicated here for the nas-first
+        # variant; keep them in sync.
         shopt -s nullglob
         declare -a ITEMS=()
         while IFS= read -r line; do
           line="${line//$'\r'/}"; [ -z "${line}" ] && continue
-          for m in ${line}; do [ -e "${m}" ] && ITEMS+=("${m}"); done
+          for m in ${line}; do
+            case "${m}" in
+              "~/"*) m="${HOME}/${m#"~/"}" ;;
+              "~")   m="${HOME}" ;;
+            esac
+            [ -e "${m}" ] && ITEMS+=("${m}")
+          done
         done <<< "${ART_PATH}"
 
         if [ "${#ITEMS[@]}" -eq 0 ]; then
@@ -444,7 +488,21 @@ runs:
           while [ "$attempt" -le "$max_attempts" ]; do
             # See main rclone_retry above for why the else-branch is required.
             if rclone "$@" 2> >(tee "$errlog" >&2); then rm -f "$errlog"; return 0; else exit_code=$?; fi
-            if grep -qiE "NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|connection refused|too many|throttl" "$errlog"; then
+            # "connection refused" is a HARD block — the NAS sshd is down or
+            # this runner's IP is fail2ban-banned. Retrying 5x just hammers
+            # the appliance and SUSTAINS the ban (each attempt is another
+            # failed connection fail2ban counts). Fail FAST so the caller
+            # fails over immediately (gh-fallback on upload, cache-miss /
+            # GitHub-first on download) instead of burning ~60s and digging
+            # the ban deeper. Distinct from the transient SFTP-init races
+            # below (sshd MaxStartups queue, mid-handshake EOF), which a
+            # short backoff genuinely recovers.
+            if grep -qE "connection refused" "$errlog"; then
+              echo "::warning::NAS connection refused — host down or runner IP fail2ban-banned; not retrying, failing over now"
+              rm -f "$errlog"
+              return "$exit_code"
+            fi
+            if grep -qiE "NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|too many|throttl" "$errlog"; then
               if [ "$attempt" -lt "$max_attempts" ]; then
                 echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
                 sleep "$((backoff + RANDOM % 4))"; backoff=$((backoff * 2 + 1)); attempt=$((attempt + 1)); continue
