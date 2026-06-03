@@ -215,3 +215,30 @@ concurrent probe were both 0-failure). The `artifact-nas` action mitigates it
 `gh run rerun <id> --failed` a reliable recovery — see the action README's
 "Reliability hardening" section. Loosening `MaxStartups` in `sshd_config_sftp`
 may help but is unverified on this firmware.
+
+## Load-test harness (`.github/workflows/nas-loadtest.yml`)
+
+A tunable, public-safe load test for the NAS SFTP path, living next to the action
+it exercises. Fans out N GitHub runners (distinct egress IPs); each runs a
+layered `nas-doctor.sh` sanity probe, then a concurrent **upload** burst via
+`nas-rclone.sh` (the same flags the upload/download actions use), byte-verified.
+
+Run it from the Actions tab (manual). Inputs let you **sweep the rclone config**
+without touching the action — confirm a setting doesn't break the NAS first:
+
+| input | maps to | default |
+|---|---|---|
+| `fanout` | parallel runners (distinct source IPs) | 20 |
+| `burst_seconds` | per-runner sustained upload duration | 30 |
+| `transfers` | rclone `--transfers` | 2 |
+| `checkers` | rclone `--checkers` | 2 |
+| `tpslimit` | rclone `--tpslimit` | 4 |
+
+The run **Summary** reports per-runner ok/bad + byte-verify and the `nas-doctor`
+failing layer. `nas-rclone.sh` defaults equal the action's flags (it mirrors
+production) and reads `NAS_RCLONE_*` env for the sweep.
+
+**Requires** repo/org secrets `RCLONE_CONF_B64` (base64 rclone.conf — NAS host/
+port/user live here, never in the repo) and `NAS_DEST`. Validated config
+`transfers=2 checkers=2 tpslimit=4`: 0% upload failure at fanout 40 & 80 with the
+firewall on, no daemon wedge.
