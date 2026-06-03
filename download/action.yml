@@ -203,9 +203,10 @@ runs:
         # rclone_retry() handles the init-layer EOF that --retries does NOT
         # cover (see upload/action.yml for the full reasoning).
         RC_FLAGS=(
-          --transfers 2 --retries 3 --low-level-retries 3
+          --transfers 2 --checkers 2 --retries 1 --low-level-retries 10
           --sftp-concurrency 1 --sftp-disable-concurrent-reads
-          --timeout 30s --contimeout 10s
+          --tpslimit 4 --tpslimit-burst 4
+          --timeout 60s --contimeout 20s
           --stats-one-line
         )
         rclone_retry() {
@@ -223,10 +224,10 @@ runs:
             else
               exit_code=$?
             fi
-            if grep -qE "NewFs:|couldn't initialise SFTP|unexpected EOF|connection reset|version packet from server" "$errlog"; then
+            if grep -qiE "NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|connection refused|too many|throttl" "$errlog"; then
               if [ "$attempt" -lt "$max_attempts" ]; then
                 echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
-                sleep "$backoff"
+                sleep "$((backoff + RANDOM % 4))"
                 backoff=$((backoff * 2 + 1))
                 attempt=$((attempt + 1))
                 continue
