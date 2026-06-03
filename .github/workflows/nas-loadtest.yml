@@ -1,0 +1,134 @@
+name: NAS SFTP Load Test
+
+# Tunable load-test harness for the NAS SFTP path this action uses. Fans out N
+# GitHub runners (distinct egress IPs), each runs a layered sanity probe
+# (nas-doctor) then a concurrent UPLOAD burst via nas/asustor/nas-rclone.sh
+# (the same flags the upload/download actions use), byte-verified. The rclone
+# config is exposed as inputs so you can sweep --transfers/--checkers/--tpslimit
+# and confirm a setting doesn't break the NAS before changing the action.
+#
+# Public-safe: the NAS host/port/user all come from the RCLONE_CONF_B64 SECRET,
+# never from this file. Requires repo/org secrets RCLONE_CONF_B64 (+ NAS_DEST).
+# Manual only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fanout:
+        description: "parallel runners (distinct egress IPs hitting the NAS at once)"
+        required: true
+        default: "20"
+      burst_seconds:
+        description: "per-runner sustained upload burst duration (seconds)"
+        required: true
+        default: "30"
+      transfers:
+        description: "rclone --transfers (concurrent transfers per runner)"
+        required: true
+        default: "2"
+      checkers:
+        description: "rclone --checkers (concurrent check connections per runner)"
+        required: true
+        default: "2"
+      tpslimit:
+        description: "rclone --tpslimit (transactions/sec cap per runner; 0 = unlimited)"
+        required: true
+        default: "4"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nas-loadtest
+  cancel-in-progress: true
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.gen.outputs.shards }}
+    steps:
+      - id: gen
+        run: |
+          n="${{ github.event.inputs.fanout }}"
+          shards=$(seq 1 "$n" | jq -R 'tonumber' | jq -cs '.')
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "fanout=$n  config: transfers=${{ github.event.inputs.transfers }} checkers=${{ github.event.inputs.checkers }} tpslimit=${{ github.event.inputs.tpslimit }}"
+
+  probe:
+    needs: prep
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 256
+      matrix:
+        shard: ${{ fromJSON(needs.prep.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rclone
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq rclone && rclone version | head -1
+      - name: Synchronize burst start (wall-clock barrier)
+        run: |
+          now=$(date +%s); barrier=$(( (now/120 + 1) * 120 )); sleep $(( barrier - now ))
+          echo "barrier=$(date -u -d @$barrier +%H:%M:%S) shard=${{ matrix.shard }}"
+      - name: Sanity probe (nas-doctor) + concurrent upload burst
+        env:
+          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
+          NAS_DEST: ${{ secrets.NAS_DEST || 'ci-artifacts' }}
+          NAS_RCLONE_TRANSFERS: ${{ github.event.inputs.transfers }}
+          NAS_RCLONE_CHECKERS: ${{ github.event.inputs.checkers }}
+          NAS_RCLONE_TPSLIMIT: ${{ github.event.inputs.tpslimit }}
+        run: |
+          set +e +o pipefail
+          mkdir -p out
+          myip=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null || echo "?")
+          cc=$(curl -s --max-time 8 "http://ip-api.com/json/${myip}?fields=continentCode" 2>/dev/null | sed -n 's/.*"continentCode":"\([^"]*\)".*/\1/p')
+          echo "shard=${{ matrix.shard }} egress_ip=$myip cc=$cc"
+          # 1) layered sanity probe — where (if anywhere) does it break?
+          bash nas/asustor/nas-doctor.sh --json > "out/doctor-${{ matrix.shard }}.json" || true
+          cat "out/doctor-${{ matrix.shard }}.json"
+          if [ -z "${RCLONE_CONF_B64:-}" ]; then echo "::warning::RCLONE_CONF_B64 unset — add the secret"; exit 0; fi
+          conf=$(mktemp); printf '%s' "$RCLONE_CONF_B64" | base64 -d > "$conf"; chmod 600 "$conf"
+          remote=$(sed -n 's/^\[\(.*\)\]$/\1/p' "$conf" | head -1)
+          payload=$(mktemp); head -c 65536 /dev/urandom > "$payload"
+          base="${NAS_DEST}/loadtest/${{ github.run_id }}/shard-${{ matrix.shard }}"
+          end=$(( $(date +%s) + ${{ github.event.inputs.burst_seconds }} )); ok=0; bad=0; i=0
+          # 2) concurrent UPLOAD burst via the action's own client logic (tunable flags)
+          while [ "$(date +%s)" -lt "$end" ]; do
+            i=$((i+1))
+            if RCLONE_CONFIG="$conf" bash nas/asustor/nas-rclone.sh "$payload" "${remote}:${base}/f-${i}.bin" >/dev/null 2>&1; then ok=$((ok+1)); else bad=$((bad+1)); fi
+          done
+          # 3) sanity: last upload round-trips byte-identical
+          verify="bad"
+          if RCLONE_CONFIG="$conf" rclone cat "${remote}:${base}/f-${i}.bin" --contimeout 10s --timeout 30s 2>/dev/null | cmp -s - "$payload"; then verify="ok"; fi
+          rm -f "$payload" "$conf"
+          printf '{"shard":%s,"egress_ip":"%s","cc":"%s","ok":%d,"bad":%d,"verify":"%s"}\n' \
+            "${{ matrix.shard }}" "$myip" "$cc" "$ok" "$bad" "$verify" | tee "out/burst-${{ matrix.shard }}.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "nas-loadtest-${{ matrix.shard }}", path: out/, retention-days: 2 }
+
+  summarize:
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: all, pattern: "nas-loadtest-*", merge-multiple: true }
+      - name: Aggregate
+        run: |
+          set -uo pipefail
+          S="$GITHUB_STEP_SUMMARY"
+          echo "## NAS load test — fanout=${{ github.event.inputs.fanout }}, config: transfers=${{ github.event.inputs.transfers }} checkers=${{ github.event.inputs.checkers }} tpslimit=${{ github.event.inputs.tpslimit }}" >> "$S"
+          echo "" >> "$S"; echo "| shard | cc | egress_ip | ok | bad | verify |" >> "$S"; echo "|---|---|---|---|---|---|" >> "$S"
+          tok=0; tbad=0; v=0; n=0
+          for f in all/burst-*.json; do
+            [ -f "$f" ] || continue
+            o=$(jq -r '.ok' "$f"); b=$(jq -r '.bad' "$f"); vr=$(jq -r '.verify' "$f")
+            tok=$((tok+o)); tbad=$((tbad+b)); n=$((n+1)); [ "$vr" = ok ] && v=$((v+1))
+            echo "| $(jq -r '.shard' "$f") | $(jq -r '.cc' "$f") | $(jq -r '.egress_ip' "$f") | $o | $b | $vr |" >> "$S"
+          done
+          tot=$((tok+tbad)); pct=0; [ "$tot" -gt 0 ] && pct=$(( tbad*100/tot ))
+          echo "" >> "$S"; echo "**Uploads: $tok ok / $tbad failed (${pct}% fail) across $n runners; byte-verify ok $v/$n**" >> "$S"
+          echo "### nas-doctor FAIL/DEGRADED layers" >> "$S"
+          cat all/doctor-*.json 2>/dev/null | jq -rc '.[] | select(.status=="FAIL" or .status=="DEGRADED") | "\(.status) \(.layer)"' 2>/dev/null | sort | uniq -c | sort -rn | sed 's/^/    /' >> "$S" || echo "    (all clean)" >> "$S"
