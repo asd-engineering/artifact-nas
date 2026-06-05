@@ -237,8 +237,35 @@ runs:
           --timeout 60s --contimeout 20s
           --stats-one-line
         )
+
+        # --- wall-clock guard (v1.5.0) ---------------------------------
+        # rclone's --contimeout bounds ONLY the TCP dial and --timeout is
+        # an *idle IO* timer on an ESTABLISHED data connection — NEITHER
+        # covers the SSH handshake / SFTP-subsystem open (NewFs). A NAS
+        # that accepts the TCP connection but stalls mid-handshake wedges a
+        # single rclone invocation forever (no output, no error, no retry).
+        # See upload/action.yml for the v1.4.8 incident this prevents.
+        # Fix: run every rclone under an OS wall-clock killer; a wedge
+        # becomes exit 124/137, which rclone_retry retries then fails over.
+        # `timeout` (Linux) / `gtimeout` (macOS+coreutils); absent both we
+        # run unguarded with a warning. Tunable: RCLONE_OP_TIMEOUT (per
+        # call, default 600s), RCLONE_MAX_TOTAL (whole-step, default 1200s).
+        TIMEOUT_BIN=""
+        if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
+        elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"; fi
+        RCLONE_OP_TIMEOUT="${RCLONE_OP_TIMEOUT:-600s}"
+        RCLONE_MAX_TOTAL="${RCLONE_MAX_TOTAL:-1200}"
+        [ -z "${TIMEOUT_BIN}" ] && echo "::warning::no 'timeout'/'gtimeout' on PATH — rclone runs without a wall-clock guard"
+        run_rclone() {
+          if [ -n "${TIMEOUT_BIN}" ]; then
+            "${TIMEOUT_BIN}" --kill-after=15s "${RCLONE_OP_TIMEOUT}" rclone "$@"
+          else
+            rclone "$@"
+          fi
+        }
         rclone_retry() {
-          local max_attempts=7 attempt=1 backoff=1 errlog exit_code
+          : "${NAS_T0:=$SECONDS}"   # whole-step wall-clock origin (first call wins)
+          local max_attempts=7 attempt=1 backoff=1 errlog exit_code transient
           errlog="$(mktemp)"
           while [ "$attempt" -le "$max_attempts" ]; do
             # Capture rclone's exit explicitly in the else-branch. Per
@@ -246,7 +273,7 @@ runs:
             # the condition was false ("zero, if no condition tested
             # true"). Without the else, `exit_code=$?` always captured 0,
             # so rclone_retry returned success on every failure path.
-            if rclone "$@" 2> >(tee "$errlog" >&2); then
+            if run_rclone "$@" 2> >(tee "$errlog" >&2); then
               rm -f "$errlog"
               return 0
             else
@@ -263,15 +290,30 @@ runs:
               rm -f "$errlog"
               return "$exit_code"
             fi
-            if grep -qiE "NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|too many|throttl" "$errlog"; then
+            # Classify transient: a wall-clock kill (124/137, usually with
+            # an EMPTY errlog) OR a known init-layer signature. The kill
+            # case MUST be matched on the exit code, not the log text.
+            transient=0
+            if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
+              echo "::warning::rclone wedged — killed after ${RCLONE_OP_TIMEOUT} wall-clock (exit ${exit_code})"
+              transient=1
+            elif grep -qiE "NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|too many|throttl" "$errlog"; then
+              transient=1
+            fi
+            if [ "$transient" -eq 1 ]; then
+              if [ "$((SECONDS - NAS_T0))" -ge "${RCLONE_MAX_TOTAL}" ]; then
+                echo "::error::NAS rclone exceeded total budget ${RCLONE_MAX_TOTAL}s across ${attempt} attempt(s) — failing over"
+                rm -f "$errlog"
+                return "$exit_code"
+              fi
               if [ "$attempt" -lt "$max_attempts" ]; then
-                echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
+                echo "::warning::NAS SFTP transient failure (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
                 sleep "$((backoff + RANDOM % 4))"
                 backoff=$((backoff * 2 + 1))
                 attempt=$((attempt + 1))
                 continue
               fi
-              echo "::error::NAS SFTP init kept failing after ${max_attempts} attempts. Likely sshd MaxStartups exhausted, fail2ban ban, or appliance concurrency cap."
+              echo "::error::NAS SFTP kept failing after ${max_attempts} attempts. Likely sshd MaxStartups exhausted, fail2ban ban, appliance concurrency cap, or a mid-handshake hang."
             fi
             rm -f "$errlog"
             return "$exit_code"

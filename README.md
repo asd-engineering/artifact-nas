@@ -114,6 +114,17 @@ Use cache mode instead of writing a custom rclone wrapper script (e.g. the previ
 
 Default `rclone` flags include `--sftp-concurrency 1`, `--sftp-disable-concurrent-reads`, `--timeout 30s`, `--contimeout 10s`. Combined with the new `rclone_retry()` wrapper, the action survives transient `NewFs: ... unexpected EOF` failures from appliance NAS units (Asustor / Synology / QNAP) whose `sshd` has a low `MaxStartups` cap. Retry uses exponential backoff (1s, 3s, 7s, 15s, 31s; ~57 s budget across 5 attempts) and only triggers on init-layer error signatures — real errors (auth failure, permission denied) fail immediately.
 
+### Wall-clock guard (v1.5.0)
+
+`--contimeout` bounds only the **TCP dial** and `--timeout` is an **idle-IO** timer on an *established* data connection — **neither covers the SSH handshake / SFTP-subsystem open** (`NewFs`). A NAS whose `sshd` accepts the TCP connection but then stalls mid-handshake (e.g. `MaxStartups` queue, or a half-open connection after a `fail2ban` race) wedges a **single** `rclone` invocation **forever**: no output, no error, so `rclone_retry` never fires and the `nas-first → GitHub` fallback never triggers (both key off a non-zero *exit*, which a hang never produces). In v1.4.8 this hung one upload for **61 minutes** until the job hit its 90-minute cap and GitHub cancelled it (`The operation was canceled.`).
+
+v1.5.0 runs every `rclone` under an OS wall-clock killer (`timeout`, or `gtimeout` on macOS+coreutils; unguarded with a warning if neither is present). A wedge becomes exit `124`/`137`, which `rclone_retry` treats as a transient → backs off → retries → fails over. A whole-step budget guarantees the action can never again approach the job cap. Both knobs are env-tunable:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `RCLONE_OP_TIMEOUT` | `600s` | Wall-clock limit for a single `rclone` invocation. |
+| `RCLONE_MAX_TOTAL` | `1200` | Total budget (seconds) across all retries before the step fails over. |
+
 ### Reliability hardening (v1.4.5 – v1.4.7)
 
 Battle-tested against a real Asustor `sftpmand` (OpenSSH `internal-sftp`) under
