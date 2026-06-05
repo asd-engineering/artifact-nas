@@ -114,16 +114,27 @@ Use cache mode instead of writing a custom rclone wrapper script (e.g. the previ
 
 Default `rclone` flags include `--sftp-concurrency 1`, `--sftp-disable-concurrent-reads`, `--timeout 30s`, `--contimeout 10s`. Combined with the new `rclone_retry()` wrapper, the action survives transient `NewFs: ... unexpected EOF` failures from appliance NAS units (Asustor / Synology / QNAP) whose `sshd` has a low `MaxStartups` cap. Retry uses exponential backoff (1s, 3s, 7s, 15s, 31s; ~57 s budget across 5 attempts) and only triggers on init-layer error signatures — real errors (auth failure, permission denied) fail immediately.
 
-### Wall-clock guard (v1.5.0)
+### Wall-clock guard + NAS retry window (v1.5.0)
 
 `--contimeout` bounds only the **TCP dial** and `--timeout` is an **idle-IO** timer on an *established* data connection — **neither covers the SSH handshake / SFTP-subsystem open** (`NewFs`). A NAS whose `sshd` accepts the TCP connection but then stalls mid-handshake (e.g. `MaxStartups` queue, or a half-open connection after a `fail2ban` race) wedges a **single** `rclone` invocation **forever**: no output, no error, so `rclone_retry` never fires and the `nas-first → GitHub` fallback never triggers (both key off a non-zero *exit*, which a hang never produces). In v1.4.8 this hung one upload for **61 minutes** until the job hit its 90-minute cap and GitHub cancelled it (`The operation was canceled.`).
 
-v1.5.0 runs every `rclone` under an OS wall-clock killer (`timeout`, or `gtimeout` on macOS+coreutils; unguarded with a warning if neither is present). A wedge becomes exit `124`/`137`, which `rclone_retry` treats as a transient → backs off → retries → fails over. A whole-step budget guarantees the action can never again approach the job cap. Both knobs are env-tunable:
+**Policy:** the NAS is the preferred sink, and a *refusing or stalling* NAS is **not** "dead" — v1.5.0 **retries it, hard, for a bounded window** to get the artifact onto the NAS. GitHub (or a cache miss) is the **last resort**, used only once that window is genuinely spent — i.e. the NAS is unreachable *for this run*.
+
+How it works:
+
+- **Every `rclone` runs under an OS wall-clock killer** (`timeout`, or `gtimeout` on macOS+coreutils; unguarded with a warning if neither is present). A wedge becomes exit `124`/`137` and **re-enters the retry loop** instead of blocking.
+- **Per-subcommand deadline.** List/`mkdir`/probe ops (where the handshake hang surfaces) get a **short** deadline so a wedge is caught and retried fast; `copy`/`sync` ops get a **long** deadline so a legitimately slow transfer over the throttled link isn't killed.
+- **A `mkdir` liveness probe runs before the upload copy** — it exercises connect+auth+session in one cheap call, so the retry window is spent probing the NAS rather than blocking on one big copy.
+- **`connection refused` is now *retried*, not instantly failed over** (it usually means a transient `fail2ban` ban or `sshd` not-yet-ready, i.e. *alive but refusing*). Backoff is spaced (5→60s) so the retries don't hammer `fail2ban` into *sustaining* the ban. If the ban outlasts the window, we fall over — the accepted "NAS dead-for-this-run" outcome.
+- **Auth / permission errors fail fast** (no retry) — they never self-heal, so they don't burn the window.
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `RCLONE_OP_TIMEOUT` | `600s` | Wall-clock limit for a single `rclone` invocation. |
-| `RCLONE_MAX_TOTAL` | `1200` | Total budget (seconds) across all retries before the step fails over. |
+| `RCLONE_PROBE_TIMEOUT` | `45s` | Wall-clock limit for a single list/`mkdir`/probe op. |
+| `RCLONE_OP_TIMEOUT` | `600s` | Wall-clock limit for a single `copy`/`sync` op. |
+| `RCLONE_MAX_TOTAL` | `300` | NAS retry window (seconds): how long we keep retrying the NAS before declaring it dead-for-this-run and falling over. |
+
+> **Note:** the window can't exceed the GitHub job clock — set it relative to your job's `timeout-minutes`. The 300s default suits short transient stalls and `MaxStartups` bursts; raise it if you want to wait out a full `fail2ban` ban (whose `findtime` is typically ~10 min) instead of falling over.
 
 ### Reliability hardening (v1.4.5 – v1.4.7)
 
