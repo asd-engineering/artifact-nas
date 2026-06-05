@@ -300,126 +300,47 @@ runs:
           --stats-one-line
         )
 
-        # --- wall-clock guard + NAS retry window (v1.5.0) --------------
-        # Why: --contimeout bounds only the TCP dial and --timeout is an
-        # idle-IO timer on an ESTABLISHED connection — neither covers the
-        # SSH handshake / SFTP-subsystem open (NewFs). A NAS that accepts
-        # the TCP connection then stalls mid-handshake (MaxStartups queue,
-        # half-open after a fail2ban race) wedges a single rclone call
-        # forever: no output, no exit, so nothing retries. In v1.4.8 one
-        # upload hung 61 min until the job's 90-min cap killed it.
-        #
-        # Policy: the NAS is the preferred sink and a refusing / stalling
-        # NAS is NOT "dead" — we RETRY it, hard, for a bounded window
-        # (RCLONE_MAX_TOTAL). GitHub fallback is the LAST RESORT, used only
-        # once that window is spent (NAS genuinely unreachable this run).
-        # Mechanics: every rclone runs under an OS wall-clock killer, so a
-        # wedge becomes exit 124/137 and re-enters the retry loop instead
-        # of blocking. Deadline is per-subcommand — list/mkdir/probe ops
-        # get a SHORT deadline (the handshake hang shows up here, so we
-        # catch + retry it fast); copy ops get a LONG deadline so a
-        # legitimately slow transfer over the throttled link isn't killed.
-        # `timeout` (Linux) / `gtimeout` (macOS+coreutils); absent both we
-        # run unguarded with a warning. Tunable via env:
-        #   RCLONE_PROBE_TIMEOUT  list/mkdir/probe ops   (default 45s)
-        #   RCLONE_OP_TIMEOUT     copy/sync ops          (default 600s)
-        #   RCLONE_MAX_TOTAL      NAS retry window, secs  (default 300)
-        TIMEOUT_BIN=""
-        if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
-        elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"; fi
-        [ -z "${TIMEOUT_BIN}" ] && echo "::warning::no 'timeout'/'gtimeout' on PATH — rclone runs without a wall-clock guard" >&2
-        RCLONE_PROBE_TIMEOUT="${RCLONE_PROBE_TIMEOUT:-45s}"
-        RCLONE_OP_TIMEOUT="${RCLONE_OP_TIMEOUT:-600s}"
-        RCLONE_MAX_TOTAL="${RCLONE_MAX_TOTAL:-300}"
-        run_rclone() {
-          # Deadline by subcommand: copies may be legitimately long; list/
-          # mkdir/probe ops are quick, so a hang there is caught fast.
-          local deadline="${RCLONE_PROBE_TIMEOUT}"
-          case "${1:-}" in
-            copy|copyto|sync|move|moveto) deadline="${RCLONE_OP_TIMEOUT}" ;;
-          esac
-          if [ -n "${TIMEOUT_BIN}" ]; then
-            "${TIMEOUT_BIN}" --kill-after=15s "${deadline}" rclone "$@"
-          else
-            rclone "$@"
-          fi
-        }
-
-        # rclone_retry — retry an rclone call across the NAS retry window.
-        # Transient (RETRY): wall-clock kill (124/137), connection refused
-        #   (fail2ban ban / sshd not yet ready — alive-but-refusing, NOT
-        #   dead), and init-layer races (MaxStartups queue, mid-handshake
-        #   EOF, kex / handshake / reset / broken-pipe / i-o-timeout /
-        #   throttle). Backoff is SPACED (5,10,20,40,60s…) so retrying
-        #   "refused" lands only a handful of attempts inside the window and
-        #   does NOT hammer fail2ban into sustaining the ban.
-        # Hard (NO retry): auth failure / permission denied — won't heal on
-        #   their own; failing fast keeps them from burning the window.
-        # When the window is exhausted the call returns non-zero and the
-        # caller decides (GitHub last-resort for nas-first/fallback; hard
-        # fail for nas-only/cache). Diagnostics go to stderr so stdout stays
-        # clean for callers that capture it (e.g. download's lsf listing).
-        rclone_retry() {
-          : "${NAS_T0:=$SECONDS}"   # NAS retry-window origin (first call wins)
-          local backoff=5 errlog exit_code transient elapsed left
-          while :; do
-            errlog="$(mktemp)"
-            # Capture rclone's exit explicitly in the else-branch (a bare
-            # `if cmd; then` leaves $?=0 when the condition is false).
-            if run_rclone "$@" 2> >(tee "$errlog" >&2); then
-              rm -f "$errlog"
-              return 0
-            else
-              exit_code=$?
-            fi
-            # Hard, non-retryable: bad credentials / permissions.
-            if grep -qiE "permission denied|unable to authenticate|authentication failed|no such (host|identity)" "$errlog"; then
-              echo "::error::NAS hard error (auth/permission) — not retryable" >&2
-              rm -f "$errlog"
-              return "$exit_code"
-            fi
-            # Transient? wall-clock kill (124/137, usually EMPTY errlog so
-            # match on exit code) OR a known refused/init-layer signature.
-            transient=0
-            if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
-              echo "::warning::rclone wedged — killed by wall-clock guard (exit ${exit_code})" >&2
-              transient=1
-            elif grep -qiE "connection refused|NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|too many|throttl" "$errlog"; then
-              transient=1
-            fi
-            rm -f "$errlog"
-            [ "$transient" -ne 1 ] && return "$exit_code"   # unknown hard error
-            elapsed=$((SECONDS - NAS_T0))
-            if [ "$elapsed" -ge "${RCLONE_MAX_TOTAL}" ]; then
-              echo "::error::NAS unreachable after ${elapsed}s (window ${RCLONE_MAX_TOTAL}s) — treating NAS as dead for this run" >&2
-              return "$exit_code"
-            fi
-            left=$((RCLONE_MAX_TOTAL - elapsed))
-            echo "::warning::NAS not ready (exit ${exit_code}) — retrying in ${backoff}s (${left}s of NAS window left)" >&2
-            sleep "$backoff"
-            backoff=$((backoff * 2)); [ "$backoff" -gt 60 ] && backoff=60
-          done
-        }
+        # --- wall-clock guard + NAS retry budget (v1.5.0) --------------
+        # All the rclone timeout/retry logic lives in ../rclone-retry.sh
+        # (one source of truth for the three call sites). It runs every
+        # rclone under an OS wall-clock killer and retries transient /
+        # refusing / stalling errors within a FAILURE budget — only time
+        # spent on FAILED attempts counts, so a slow-but-successful transfer
+        # never starves later items. A spent budget returns NAS_DEAD_RC;
+        # a hard auth/permission error returns immediately. See that file
+        # for the full rationale and the RCLONE_*/NAS_DEAD_RC contract.
+        source "${GITHUB_ACTION_PATH}/../rclone-retry.sh"
 
         # Liveness probe BEFORE the (possibly large) copy. `mkdir` exercises
         # connect+auth+session+write in one cheap call and pre-creates the
-        # destination — and it's the call that surfaces a mid-handshake hang
-        # quickly, so rclone_retry spends the window retrying the NAS rather
-        # than blocking once on the big copy. Can't get through the whole
-        # window → NAS is dead-for-this-run → fail (caller fails over).
+        # destination — it's where a mid-handshake hang surfaces, so the
+        # failure budget is spent probing the NAS rather than blocking once
+        # on the big copy. (rclone mkdir creates parent dirs.)
         if ! rclone_retry mkdir "${REMOTE}:${DEST_DIR}" "${RC_FLAGS[@]}"; then
-          echo "::error::NAS did not accept a session within ${RCLONE_MAX_TOTAL}s — NAS treated as dead for this run" >&2
-          exit 1
+          if [ "${MODE}" = "cache" ]; then
+            echo "::warning::NAS unreachable — cache upload skipped (best-effort)"; exit 0
+          fi
+          echo "::error::NAS unreachable — could not create ${DEST_DIR}"; exit 1
         fi
 
         for item in "${ITEMS[@]}"; do
           if [ -d "${item}" ]; then
-            base="$(basename "${item}")"
-            echo "copy dir  ${item} -> ${REMOTE}:${DEST_DIR}/${base}"
-            rclone_retry copy "${item}" "${REMOTE}:${DEST_DIR}/${base}" "${RC_FLAGS[@]}"
+            base="$(basename "${item}")"; dst="${REMOTE}:${DEST_DIR}/${base}"
+            echo "copy dir  ${item} -> ${dst}"
           else
-            echo "copy file ${item} -> ${REMOTE}:${DEST_DIR}/"
-            rclone_retry copy "${item}" "${REMOTE}:${DEST_DIR}/" "${RC_FLAGS[@]}"
+            dst="${REMOTE}:${DEST_DIR}/"
+            echo "copy file ${item} -> ${dst}"
+          fi
+          if ! rclone_retry copy "${item}" "${dst}" "${RC_FLAGS[@]}"; then
+            # cache uploads are best-effort (the paired download treats a
+            # miss as success), so a NAS hiccup must not fail the job. Every
+            # other mode reaching here has no further NAS recourse in this
+            # step (fallback already tried GitHub; always already uploaded
+            # to GitHub; nas-only has no net) → fatal.
+            if [ "${MODE}" = "cache" ]; then
+              echo "::warning::NAS cache upload failed — non-fatal (cache write is best-effort)"; exit 0
+            fi
+            exit 1
           fi
         done
 
@@ -540,65 +461,14 @@ runs:
           --timeout 60s --contimeout 20s
           --stats-one-line
         )
-        # Wall-clock guard + NAS retry window — see the main nas step for the
-        # full rationale and policy. Identical behaviour here; in nas-first
-        # it's doubly important because a hang otherwise starves the
-        # gh-fallback step that exists precisely for NAS trouble. The NAS is
-        # retried hard for RCLONE_MAX_TOTAL; only then does this step exit
-        # non-zero so the gh-fallback (last resort = NAS dead) can fire.
-        TIMEOUT_BIN=""
-        if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
-        elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"; fi
-        [ -z "${TIMEOUT_BIN}" ] && echo "::warning::no 'timeout'/'gtimeout' on PATH — rclone runs without a wall-clock guard" >&2
-        RCLONE_PROBE_TIMEOUT="${RCLONE_PROBE_TIMEOUT:-45s}"
-        RCLONE_OP_TIMEOUT="${RCLONE_OP_TIMEOUT:-600s}"
-        RCLONE_MAX_TOTAL="${RCLONE_MAX_TOTAL:-300}"
-        run_rclone() {
-          local deadline="${RCLONE_PROBE_TIMEOUT}"
-          case "${1:-}" in
-            copy|copyto|sync|move|moveto) deadline="${RCLONE_OP_TIMEOUT}" ;;
-          esac
-          if [ -n "${TIMEOUT_BIN}" ]; then
-            "${TIMEOUT_BIN}" --kill-after=15s "${deadline}" rclone "$@"
-          else
-            rclone "$@"
-          fi
-        }
-        rclone_retry() {
-          : "${NAS_T0:=$SECONDS}"
-          local backoff=5 errlog exit_code transient elapsed left
-          while :; do
-            errlog="$(mktemp)"
-            # See main rclone_retry above for why the else-branch is required.
-            if run_rclone "$@" 2> >(tee "$errlog" >&2); then rm -f "$errlog"; return 0; else exit_code=$?; fi
-            if grep -qiE "permission denied|unable to authenticate|authentication failed|no such (host|identity)" "$errlog"; then
-              echo "::error::NAS hard error (auth/permission) — not retryable" >&2
-              rm -f "$errlog"; return "$exit_code"
-            fi
-            transient=0
-            if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
-              echo "::warning::rclone wedged — killed by wall-clock guard (exit ${exit_code})" >&2
-              transient=1
-            elif grep -qiE "connection refused|NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|too many|throttl" "$errlog"; then
-              transient=1
-            fi
-            rm -f "$errlog"
-            [ "$transient" -ne 1 ] && return "$exit_code"
-            elapsed=$((SECONDS - NAS_T0))
-            if [ "$elapsed" -ge "${RCLONE_MAX_TOTAL}" ]; then
-              echo "::warning::NAS unreachable after ${elapsed}s (window ${RCLONE_MAX_TOTAL}s) — gh-fallback step will pick this up" >&2
-              return "$exit_code"
-            fi
-            left=$((RCLONE_MAX_TOTAL - elapsed))
-            echo "::warning::NAS not ready (exit ${exit_code}) — retrying in ${backoff}s (${left}s of NAS window left)" >&2
-            sleep "$backoff"
-            backoff=$((backoff * 2)); [ "$backoff" -gt 60 ] && backoff=60
-          done
-        }
+        # Shared wall-clock guard + retry budget (see ../rclone-retry.sh and
+        # the main nas step). In nas-first a non-zero exit here is the SIGNAL
+        # that drives the gh-fallback step, so `|| exit $?` propagates a spent
+        # budget / hard error straight through to that fallback.
+        source "${GITHUB_ACTION_PATH}/../rclone-retry.sh"
 
-        # Liveness probe before the copy (see main nas step). Probe failure
-        # means the NAS stayed unreachable across the whole window → exit
-        # non-zero so the gh-fallback step fires.
+        # Liveness probe before the copy. Probe failure (NAS unreachable
+        # across the failure budget) exits non-zero so gh-fallback fires.
         rclone_retry mkdir "${REMOTE}:${DEST_DIR}" "${RC_FLAGS[@]}" || exit $?
 
         for item in "${ITEMS[@]}"; do
