@@ -300,68 +300,47 @@ runs:
           --stats-one-line
         )
 
-        # rclone_retry — wraps an rclone invocation with exponential
-        # backoff specifically for SFTP NewFs failures (server-side queue
-        # exhaustion, mid-handshake EOF, sshd restart races). Backoff:
-        # 1s, 3s, 7s, 15s, 31s (cumulative ~57s across 5 attempts) — long
-        # enough for sshd's MaxStartups queue to drain after a CI burst,
-        # short enough not to balloon a permanently-broken build. Only
-        # retries on init-layer signatures; real errors (auth fail, perm
-        # denied) fail immediately.
-        rclone_retry() {
-          local max_attempts=7 attempt=1 backoff=1 errlog exit_code
-          errlog="$(mktemp)"
-          while [ "$attempt" -le "$max_attempts" ]; do
-            # Capture rclone's exit explicitly in the else-branch. Per
-            # POSIX, `$?` AFTER `if cmd; then …; fi` (no else) is 0 when
-            # the condition was false ("zero, if no condition tested
-            # true"). Without the else, `exit_code=$?` always captured 0,
-            # so rclone_retry returned success on every failure path.
-            if rclone "$@" 2> >(tee "$errlog" >&2); then
-              rm -f "$errlog"
-              return 0
-            else
-              exit_code=$?
-            fi
-            # "connection refused" is a HARD block — the NAS sshd is down or
-            # this runner's IP is fail2ban-banned. Retrying 5x just hammers
-            # the appliance and SUSTAINS the ban (each attempt is another
-            # failed connection fail2ban counts). Fail FAST so the caller
-            # fails over immediately (gh-fallback on upload, cache-miss /
-            # GitHub-first on download) instead of burning ~60s and digging
-            # the ban deeper. Distinct from the transient SFTP-init races
-            # below (sshd MaxStartups queue, mid-handshake EOF), which a
-            # short backoff genuinely recovers.
-            if grep -qE "connection refused" "$errlog"; then
-              echo "::warning::NAS connection refused — host down or runner IP fail2ban-banned; not retrying, failing over now"
-              rm -f "$errlog"
-              return "$exit_code"
-            fi
-            if grep -qiE "NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|too many|throttl" "$errlog"; then
-              if [ "$attempt" -lt "$max_attempts" ]; then
-                echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
-                sleep "$((backoff + RANDOM % 4))"
-                backoff=$((backoff * 2 + 1))
-                attempt=$((attempt + 1))
-                continue
-              fi
-              echo "::error::NAS SFTP init kept failing after ${max_attempts} attempts. Likely sshd MaxStartups exhausted, fail2ban ban, or appliance concurrency cap."
-            fi
-            rm -f "$errlog"
-            return "$exit_code"
-          done
-          rm -f "$errlog"
-          return 1
-        }
+        # --- wall-clock guard + NAS retry budget (v1.5.0) --------------
+        # All the rclone timeout/retry logic lives in ../rclone-retry.sh
+        # (one source of truth for the three call sites). It runs every
+        # rclone under an OS wall-clock killer and retries transient /
+        # refusing / stalling errors within a FAILURE budget — only time
+        # spent on FAILED attempts counts, so a slow-but-successful transfer
+        # never starves later items. A spent budget returns NAS_DEAD_RC;
+        # a hard auth/permission error returns immediately. See that file
+        # for the full rationale and the RCLONE_*/NAS_DEAD_RC contract.
+        source "${GITHUB_ACTION_PATH}/../rclone-retry.sh"
+
+        # Liveness probe BEFORE the (possibly large) copy. `mkdir` exercises
+        # connect+auth+session+write in one cheap call and pre-creates the
+        # destination — it's where a mid-handshake hang surfaces, so the
+        # failure budget is spent probing the NAS rather than blocking once
+        # on the big copy. (rclone mkdir creates parent dirs.)
+        if ! rclone_retry mkdir "${REMOTE}:${DEST_DIR}" "${RC_FLAGS[@]}"; then
+          if [ "${MODE}" = "cache" ]; then
+            echo "::warning::NAS unreachable — cache upload skipped (best-effort)"; exit 0
+          fi
+          echo "::error::NAS unreachable — could not create ${DEST_DIR}"; exit 1
+        fi
 
         for item in "${ITEMS[@]}"; do
           if [ -d "${item}" ]; then
-            base="$(basename "${item}")"
-            echo "copy dir  ${item} -> ${REMOTE}:${DEST_DIR}/${base}"
-            rclone_retry copy "${item}" "${REMOTE}:${DEST_DIR}/${base}" "${RC_FLAGS[@]}"
+            base="$(basename "${item}")"; dst="${REMOTE}:${DEST_DIR}/${base}"
+            echo "copy dir  ${item} -> ${dst}"
           else
-            echo "copy file ${item} -> ${REMOTE}:${DEST_DIR}/"
-            rclone_retry copy "${item}" "${REMOTE}:${DEST_DIR}/" "${RC_FLAGS[@]}"
+            dst="${REMOTE}:${DEST_DIR}/"
+            echo "copy file ${item} -> ${dst}"
+          fi
+          if ! rclone_retry copy "${item}" "${dst}" "${RC_FLAGS[@]}"; then
+            # cache uploads are best-effort (the paired download treats a
+            # miss as success), so a NAS hiccup must not fail the job. Every
+            # other mode reaching here has no further NAS recourse in this
+            # step (fallback already tried GitHub; always already uploaded
+            # to GitHub; nas-only has no net) → fatal.
+            if [ "${MODE}" = "cache" ]; then
+              echo "::warning::NAS cache upload failed — non-fatal (cache write is best-effort)"; exit 0
+            fi
+            exit 1
           fi
         done
 
@@ -482,37 +461,15 @@ runs:
           --timeout 60s --contimeout 20s
           --stats-one-line
         )
-        rclone_retry() {
-          local max_attempts=7 attempt=1 backoff=1 errlog exit_code
-          errlog="$(mktemp)"
-          while [ "$attempt" -le "$max_attempts" ]; do
-            # See main rclone_retry above for why the else-branch is required.
-            if rclone "$@" 2> >(tee "$errlog" >&2); then rm -f "$errlog"; return 0; else exit_code=$?; fi
-            # "connection refused" is a HARD block — the NAS sshd is down or
-            # this runner's IP is fail2ban-banned. Retrying 5x just hammers
-            # the appliance and SUSTAINS the ban (each attempt is another
-            # failed connection fail2ban counts). Fail FAST so the caller
-            # fails over immediately (gh-fallback on upload, cache-miss /
-            # GitHub-first on download) instead of burning ~60s and digging
-            # the ban deeper. Distinct from the transient SFTP-init races
-            # below (sshd MaxStartups queue, mid-handshake EOF), which a
-            # short backoff genuinely recovers.
-            if grep -qE "connection refused" "$errlog"; then
-              echo "::warning::NAS connection refused — host down or runner IP fail2ban-banned; not retrying, failing over now"
-              rm -f "$errlog"
-              return "$exit_code"
-            fi
-            if grep -qiE "NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|too many|throttl" "$errlog"; then
-              if [ "$attempt" -lt "$max_attempts" ]; then
-                echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
-                sleep "$((backoff + RANDOM % 4))"; backoff=$((backoff * 2 + 1)); attempt=$((attempt + 1)); continue
-              fi
-              echo "::warning::NAS SFTP kept failing — gh-fallback step will pick this up"
-            fi
-            rm -f "$errlog"; return "$exit_code"
-          done
-          rm -f "$errlog"; return 1
-        }
+        # Shared wall-clock guard + retry budget (see ../rclone-retry.sh and
+        # the main nas step). In nas-first a non-zero exit here is the SIGNAL
+        # that drives the gh-fallback step, so `|| exit $?` propagates a spent
+        # budget / hard error straight through to that fallback.
+        source "${GITHUB_ACTION_PATH}/../rclone-retry.sh"
+
+        # Liveness probe before the copy. Probe failure (NAS unreachable
+        # across the failure budget) exits non-zero so gh-fallback fires.
+        rclone_retry mkdir "${REMOTE}:${DEST_DIR}" "${RC_FLAGS[@]}" || exit $?
 
         for item in "${ITEMS[@]}"; do
           if [ -d "${item}" ]; then

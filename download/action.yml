@@ -237,48 +237,17 @@ runs:
           --timeout 60s --contimeout 20s
           --stats-one-line
         )
-        rclone_retry() {
-          local max_attempts=7 attempt=1 backoff=1 errlog exit_code
-          errlog="$(mktemp)"
-          while [ "$attempt" -le "$max_attempts" ]; do
-            # Capture rclone's exit explicitly in the else-branch. Per
-            # POSIX, `$?` AFTER `if cmd; then …; fi` (no else) is 0 when
-            # the condition was false ("zero, if no condition tested
-            # true"). Without the else, `exit_code=$?` always captured 0,
-            # so rclone_retry returned success on every failure path.
-            if rclone "$@" 2> >(tee "$errlog" >&2); then
-              rm -f "$errlog"
-              return 0
-            else
-              exit_code=$?
-            fi
-            # "connection refused" is a HARD block — the NAS sshd is down or
-            # this runner's IP is fail2ban-banned. Retrying 5x just hammers
-            # the appliance and SUSTAINS the ban. Fail FAST so the caller
-            # fails over immediately (GitHub-first / cache-miss) instead of
-            # burning ~60s and digging the ban deeper. Distinct from the
-            # transient SFTP-init races below, which a short backoff recovers.
-            if grep -qE "connection refused" "$errlog"; then
-              echo "::warning::NAS connection refused — host down or runner IP fail2ban-banned; not retrying, failing over now"
-              rm -f "$errlog"
-              return "$exit_code"
-            fi
-            if grep -qiE "NewFs:|couldn.?t initialise SFTP|couldn.?t connect|unexpected EOF|connection reset|connection closed|version packet|kex_exchange|handshake failed|broken pipe|i/o timeout|too many|throttl" "$errlog"; then
-              if [ "$attempt" -lt "$max_attempts" ]; then
-                echo "::warning::NAS SFTP init failed (attempt ${attempt}/${max_attempts}) — retrying in ${backoff}s"
-                sleep "$((backoff + RANDOM % 4))"
-                backoff=$((backoff * 2 + 1))
-                attempt=$((attempt + 1))
-                continue
-              fi
-              echo "::error::NAS SFTP init kept failing after ${max_attempts} attempts. Likely sshd MaxStartups exhausted, fail2ban ban, or appliance concurrency cap."
-            fi
-            rm -f "$errlog"
-            return "$exit_code"
-          done
-          rm -f "$errlog"
-          return 1
-        }
+
+        # --- wall-clock guard + NAS retry budget (v1.5.0) --------------
+        # Shared logic in ../rclone-retry.sh (one source of truth for the
+        # three call sites): every rclone runs under an OS wall-clock killer,
+        # transient / refusing / stalling errors retry within a FAILURE
+        # budget (only failed-attempt time counts, so a slow-but-successful
+        # transfer never starves later retries), a spent budget returns
+        # NAS_DEAD_RC, and a hard auth/permission error returns immediately.
+        # See that file for the full rationale and the RCLONE_*/NAS_DEAD_RC
+        # contract.
+        source "${GITHUB_ACTION_PATH}/../rclone-retry.sh"
         # --- list the SRC_DIR once to learn what's there ---
         # We use this listing to (a) detect cache miss cheaply (one query
         # instead of one-failed-copy-per-item) and (b) distinguish files
@@ -291,12 +260,23 @@ runs:
         # uses the file's basename for the destination filename).
         #
         # `lsf --max-depth 1` lists immediate children; entries ending in
-        # `/` are dirs, otherwise files. Empty output = cache-miss (the
-        # SRC_DIR doesn't exist on the remote). `|| true` because lsf on
-        # a missing remote dir exits non-zero — that's the cache-miss
-        # signal in `mode: cache`, and a hard error elsewhere (handled
-        # via the ANY_HIT check below).
-        REMOTE_LISTING="$(rclone_retry lsf --max-depth 1 "${REMOTE}:${SRC_DIR}/" "${RC_FLAGS[@]}" 2>/dev/null || true)"
+        # `/` are dirs, otherwise files. Empty output = the SRC_DIR doesn't
+        # exist on the remote = a clean cache-miss. We MUST distinguish that
+        # from a NAS that was UNREACHABLE during the listing: rclone_retry
+        # returns NAS_DEAD_RC when its failure budget is spent, whereas a
+        # genuinely missing dir returns rclone's own (non-retried) code. So
+        # capture the rc and, in non-cache modes, treat a dead NAS as a hard
+        # error instead of silently degrading to "produced no files" (in
+        # cache mode an unreachable NAS is still tolerated as a miss).
+        # `2>/dev/null` suppresses the benign "directory not found" noise of
+        # a real miss; the trailing `|| LSF_RC=$?` keeps `set -e` from
+        # aborting on that expected non-zero.
+        LSF_RC=0
+        REMOTE_LISTING="$(rclone_retry lsf --max-depth 1 "${REMOTE}:${SRC_DIR}/" "${RC_FLAGS[@]}" 2>/dev/null)" || LSF_RC=$?
+        if [ "${LSF_RC}" = "${NAS_DEAD_RC}" ] && [ "${MODE}" != "cache" ]; then
+          echo "::error::NAS unreachable while listing ${SRC_DIR} — refusing to fall back to a cache-miss in mode '${MODE}'" >&2
+          exit 1
+        fi
 
         # --- LEGACY single-target case ----------------------------------
         # `path: .` (or any single root-like destination) means "dump
